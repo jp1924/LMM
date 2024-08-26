@@ -2,17 +2,16 @@ import math
 
 import torch
 import torch.nn as nn
-from configuration_llava_next_doc import LlavaNextDocConfig
 from einops import rearrange
 
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
-    LlavaNextConfig,
     LlavaNextForConditionalGeneration,
 )
 from transformers.activations import ACT2FN
-from transformers.models.llava_next.modeling_llava_next import get_anyres_image_grid_shape, unpad_image
+
+from .configuration_llava_next_doc import LlavaNextDocConfig
 
 
 class LlavaNextDocHReducer(nn.Module):
