@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from dataclasses import dataclass, field
@@ -7,7 +8,6 @@ import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
-
 
 from transformers import (
     HfArgumentParser,
@@ -89,6 +89,7 @@ class LlavaPretrainingArguments(TrainingArguments):
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
     )
 
+
 global GLOBAL_LOGGER
 GLOBAL_LOGGER = None
 
@@ -98,7 +99,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         try:
             image_ls = example["image"]
             image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
-        except:
+        except BaseException as e:
+            logger.info(f"image load시 애러 발생: {e}")
             return {
                 "pixel_values": [],
                 "input_ids": [],
@@ -166,7 +168,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
         data_ls = list()
         for prefix in prefix_ls:
-            check_key: str = lambda key: (prefix in key)
+            check_key: str = lambda key: (prefix in key)  # noqa: E731
             filter_data = [
                 concatenate_datasets(data_dict.pop(key)) for key in list(data_dict.keys()) if check_key(key)
             ]
@@ -229,7 +231,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         with train_args.main_process_first(desc="data preprocess"):
             cache_file_name = None
             if train_args.cache_file_name:
-                get_cache_path: str = lambda x: os.path.join(
+                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
                     train_args.cache_dir,
                     f"{name}-{x}_{train_args.cache_file_name}",
                 )
