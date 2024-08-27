@@ -145,23 +145,25 @@ def main(train_args: LlavaNextArguments) -> None:
         input_id_ls = list()
         length_ls = list()
         for image, conversation in zip(image_ls, final_conver_ls):
-            outputs = processor(
-                images=image,
-                text=processor.apply_chat_template(conversation[:2], img_token=img_token),
-                return_tensors="np",
-            )
-            pixel_values, input_ids, image_sizes = (
-                outputs["pixel_values"][0],
-                outputs["input_ids"][0],
-                outputs["image_sizes"][0],
-            )
-            img_token_length = config.vision_config.image_size * pixel_values.shape[0]
+            idx = 0
+            while conversation[idx : idx + 2]:
+                outputs = processor(
+                    images=image,
+                    text=processor.apply_chat_template(conversation[: idx + 2], img_token=img_token),
+                    return_tensors="np",
+                )
+                pixel_values, input_ids, image_sizes = (
+                    outputs["pixel_values"][0],
+                    outputs["input_ids"][0],
+                    outputs["image_sizes"][0],
+                )
+                img_token_length = config.vision_config.image_size * pixel_values.shape[0]
 
-            pixel_value_ls.append(pixel_values)
-            input_id_ls.append(input_ids)
-            length_ls.append(input_ids.shape[0] + img_token_length)
-            image_size_ls.append(image_sizes)
-
+                pixel_value_ls.append(pixel_values)
+                input_id_ls.append(input_ids)
+                length_ls.append(input_ids.shape[0] + img_token_length)
+                image_size_ls.append(image_sizes)
+                idx += 2
         return {
             "pixel_values": pixel_value_ls,
             "input_ids": input_id_ls,

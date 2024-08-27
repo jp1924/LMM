@@ -138,16 +138,18 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         input_id_ls = list()
         length_ls = list()
         for image, conversation in zip(image_ls, final_conver_ls):
-            breakpoint()
-            outputs = processor(
-                images=image,
-                text=processor.apply_chat_template(conversation[:2], img_token=img_token),
-                return_tensors="np",
-            )
-            pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
-            pixel_value_ls.append(pixel_values)
-            input_id_ls.append(input_ids)
-            length_ls.append(input_ids.shape[0])
+            idx = 0
+            while conversation[idx : idx + 2]:
+                outputs = processor(
+                    images=image,
+                    text=processor.apply_chat_template(conversation[: idx + 2], img_token=img_token),
+                    return_tensors="np",
+                )
+                pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
+                pixel_value_ls.append(pixel_values)
+                input_id_ls.append(input_ids)
+                length_ls.append(input_ids.shape[0])
+                idx += 2
 
         return {
             "pixel_values": pixel_value_ls,
