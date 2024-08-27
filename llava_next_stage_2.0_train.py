@@ -29,7 +29,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 @dataclass
-class LlavaNextPretrainingArguments(TrainingArguments):
+class LlavaNextArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
         default=None,
@@ -91,22 +91,29 @@ class LlavaNextPretrainingArguments(TrainingArguments):
     )
 
 
+class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
+    def __init__(self, image_processor, **kwargs):
+        super().__init__(**kwargs)
+        self.image_processor = image_processor
+
+    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        input_ids = [{"input_ids": example["input_ids"]} for example in examples]
+        pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"]]
+        image_sizes = [x["image_sizes"] for x in examples]
+
+        batch = super().torch_call(input_ids)
+        batch["pixel_values"] = torch.stack(self.image_processor._pad_for_batching(pixel_values))
+        batch["image_sizes"] = torch.stack(image_sizes)
+
+        return batch
+
+
 global GLOBAL_LOGGER
 GLOBAL_LOGGER = None
 
 
-def main(train_args: LlavaNextPretrainingArguments) -> None:
+def main(train_args: LlavaNextArguments) -> None:
     def preprocessor(example: Dict[str, Union[List[Any], List[List[Any]]]]) -> Dict[str, List[Any]]:
-        try:
-            image_ls = example["image"]
-            image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
-        except BaseException as e:
-            logger.info(f"image load시 애러 발생: {e}")
-            return {
-                "pixel_values": [],
-                "input_ids": [],
-                train_args.length_column_name: [],
-            }
         final_conver_ls = list()
         if "conversations" in example:
             conversations_ls = example["conversations"]
@@ -114,29 +121,51 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
             for idx, conversations in enumerate(conversations_ls):
                 new_conversations = list()
                 for chat in conversations:
-                    chat["content"] = json.loads(chat["content"])
+                    try:
+                        chat["content"] = json.loads(chat["content"])
+                    except BaseException as e:
+                        e
                     new_conversations.append(chat)
                 conversations_ls[idx] = new_conversations
             final_conver_ls.extend(conversations_ls)
-        else:
-            exit("지원하는 않는 데이터 타입, 종료함.")
+
+        try:
+            image_ls = example["image"] if "image" in example else [None] * len(final_conver_ls)
+            image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
+        except BaseException as e:  # noqa: F841
+            # logger.info(f"image load시 애러 발생: {e}")
+            return {
+                "pixel_values": [],
+                "input_ids": [],
+                train_args.length_column_name: [],
+            }
 
         pixel_value_ls = list()
+        image_size_ls = list()
         input_id_ls = list()
         length_ls = list()
         for image, conversation in zip(image_ls, final_conver_ls):
             outputs = processor(
                 images=image,
-                text=processor.apply_chat_template(conversation, img_token=img_token),
+                text=processor.apply_chat_template(conversation[:2], img_token=img_token),
                 return_tensors="np",
             )
-            pixel_value_ls.append(outputs["pixel_values"][0])
-            input_id_ls.append(outputs["input_ids"][0])
-            length_ls.append(outputs["input_ids"][0].shape[0])
+            pixel_values, input_ids, image_sizes = (
+                outputs["pixel_values"][0],
+                outputs["input_ids"][0],
+                outputs["image_sizes"][0],
+            )
+            img_token_length = config.vision_config.image_size * pixel_values.shape[0]
+
+            pixel_value_ls.append(pixel_values)
+            input_id_ls.append(input_ids)
+            length_ls.append(input_ids.shape[0] + img_token_length)
+            image_size_ls.append(image_sizes)
 
         return {
             "pixel_values": pixel_value_ls,
             "input_ids": input_id_ls,
+            "image_sizes": image_size_ls,
             train_args.length_column_name: length_ls,
         }
 
@@ -183,7 +212,8 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
 
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
-    model = LlavaNextDocForConditionalGeneration.from_pretrained(model_name_or_path)
+    model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path)
+    config = model.config
 
     image_processor = LlavaNextImageProcessor.from_pretrained(model_name_or_path)
     processor = LlavaNextProcessor.from_pretrained(model_name_or_path, image_processor=image_processor)
@@ -191,7 +221,7 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
 
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
-        if name not in ["multi_modal_projector"]:
+        if name not in ["multi_modal_projector", "vision_tower"]:
             continue
         parameter.requires_grad = False
 
@@ -297,6 +327,7 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForCompletionOnlyLM(
         tokenizer=processor.tokenizer,
+        image_processor=processor.image_processor,
         response_template=response_template,
     )
     trainer = Trainer(
@@ -318,7 +349,7 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
 
 
 def train(trainer: Trainer) -> None:
-    train_args: LlavaNextPretrainingArguments = trainer.args
+    train_args: LlavaNextArguments = trainer.args
     trainer.train(resume_from_checkpoint=train_args.resume_from_checkpoint)
 
     save_dir = os.path.join(train_args.output_dir, "last_model")
@@ -351,7 +382,7 @@ def predict(trainer: Trainer, test_dataset: Optional[Union[Dataset, Dict[str, Da
 
 
 if "__main__" in __name__:
-    parser = HfArgumentParser([LlavaNextPretrainingArguments])
+    parser = HfArgumentParser([LlavaNextArguments])
     train_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     if train_args.seed is not None:
