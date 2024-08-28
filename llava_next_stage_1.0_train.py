@@ -130,7 +130,6 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             question_answer_ls = example["question_answer"]
             question_answer_ls = question_answer_ls if isinstance(question_answer_ls, list) else [question_answer_ls]
             for question_answers in question_answer_ls:
-                question_answers = [x for x in question_answers if x["confidence"] == "true"]
                 question_answer = random.choice(question_answers)
                 conversation = [
                     {
