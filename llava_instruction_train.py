@@ -1,24 +1,30 @@
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
+from deepspeed.accelerator import get_accelerator
+
+# from peft import LoraConfig, TaskType, get_peft_model
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
 from transformers import (
     HfArgumentParser,
+    LlavaConfig,
     LlavaForConditionalGeneration,
     LlavaProcessor,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
-    is_torch_xla_available,
-    is_wandb_available,
     set_seed,
 )
 from transformers import logging as hf_logging
+from transformers.trainer_pt_utils import get_model_param_count
+from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -96,35 +102,41 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
 
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         input_ids = [{"input_ids": example["input_ids"]} for example in examples]
-        pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"]]
+        pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"] is not None]
         batch = super().torch_call(input_ids)
-        batch["pixel_values"] = torch.stack(pixel_values)
+        if pixel_values:
+            batch["pixel_values"] = torch.stack(pixel_values)
         return batch
 
 
-global GLOBAL_LOGGER
-GLOBAL_LOGGER = None
+class EmptyCacheCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % 5 == 0:
+            get_accelerator().empty_cache()
+            torch.cuda.empty_cache()
 
 
 def main(train_args: LlavaInsturctionArguments) -> None:
     def preprocessor(example: Dict[str, Union[List[Any], List[List[Any]]]]) -> Dict[str, List[Any]]:
-        final_conver_ls = list()
         if "conversations" in example:
             conversations_ls = example["conversations"]
             conversations_ls = conversations_ls if isinstance(conversations_ls, list) else [conversations_ls]
             for idx, conversations in enumerate(conversations_ls):
-                new_conversations = list()
-                for chat in conversations:
-                    try:
-                        chat["content"] = json.loads(chat["content"])
-                    except BaseException as e:
-                        e
-                    new_conversations.append(chat)
-                conversations_ls[idx] = new_conversations
-            final_conver_ls.extend(conversations_ls)
+                try:
+                    conversations_ls[idx] = [
+                        {
+                            "role": chat["role"],
+                            "content": json.loads(chat["content"])
+                            if re.search(r"\[\{\"type\"\:", chat["content"])
+                            else chat["content"],
+                        }
+                        for chat in conversations
+                    ]
+                except:
+                    continue
 
         try:
-            image_ls = example["image"] if "image" in example else [None] * len(final_conver_ls)
+            image_ls = example["image"] if "image" in example else [None] * len(conversations_ls)
             image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
         except BaseException as e:  # noqa: F841
             # logger.info(f"image load시 애러 발생: {e}")
@@ -137,19 +149,42 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         pixel_value_ls = list()
         input_id_ls = list()
         length_ls = list()
-        for image, conversation in zip(image_ls, final_conver_ls):
+        for image, conversation in zip(image_ls, conversations_ls):
             idx = 0
             while conversation[idx : idx + 2]:
-                outputs = processor(
-                    images=image,
-                    text=processor.apply_chat_template(conversation[: idx + 2], img_token=img_token),
-                    return_tensors="np",
+                text = processor.tokenizer.apply_chat_template(
+                    conversation[: idx + 2], img_token=img_token, tokenize=False
                 )
+                if image:
+                    outputs = processor(
+                        images=image,
+                        text=text,
+                        return_tensors="np",
+                    )
+                else:
+                    outputs = processor.tokenizer(text, return_tensors="np")
+
                 pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
+
+                if image and (image_token_index not in input_ids):
+                    break
+                elif (image is None) and (image_token_index in input_ids):
+                    break
+                # elif image and ((image_token_index == input_ids).sum() // 256) != 1:
+                elif image and (image_token_index == input_ids).sum() != 1:
+                    print(input_ids.tolist())
+                    break
+
                 pixel_value_ls.append(pixel_values)
                 input_id_ls.append(input_ids)
                 length_ls.append(input_ids.shape[0])
                 idx += 2
+
+        # 2048 - 256, 257은 이미지, 근데 값이 애매하게 나와서 1700으로 함.
+        length_flag = [length <= 1700 for length in length_ls]
+        pixel_value_ls = [pixel_value_ls[idx] for idx, flag in enumerate(length_flag) if flag]
+        input_id_ls = [input_id_ls[idx] for idx, flag in enumerate(length_flag) if flag]
+        length_ls = [length_ls[idx] for idx, flag in enumerate(length_flag) if flag]
 
         return {
             "pixel_values": pixel_value_ls,
@@ -173,38 +208,24 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
         return dataset
 
-    def set_wandb() -> None:
-        # TODO: 이건 나중에 args로 바꿀 것
-        GLOBAL_LOGGER.run.log_code(
-            train_args.wandb_code_log_dir,
-            include_fn=lambda path: path.endswith(".py") or path.endswith(".json"),
-        )
-        # logging args
-        combined_dict = {**train_args.to_dict()}
-        if hasattr(model, "config") and model.config is not None:
-            model_config = model.config.to_dict()
-            combined_dict = {**model_config, **combined_dict}
-
-        GLOBAL_LOGGER.config.update(combined_dict, allow_val_change=True)
-
-        # set default metrics
-        if getattr(GLOBAL_LOGGER, "define_metric", None):
-            GLOBAL_LOGGER.define_metric("train/global_step")
-            GLOBAL_LOGGER.define_metric("*", step_metric="train/global_step", step_sync=True)
-
-        # set model watch
-        _watch_model = os.getenv("WANDB_WATCH", "false")
-        if not is_torch_xla_available() and _watch_model in ("all", "parameters", "gradients"):
-            GLOBAL_LOGGER.watch(model, log=_watch_model, log_freq=max(100, train_args.logging_steps))
-        GLOBAL_LOGGER.run._label(code="transformers_trainer")
-
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
-    processor = LlavaProcessor.from_pretrained(model_name_or_path)
+    model.language_model.config.use_cache = False
+    config = LlavaConfig.from_pretrained(model_name_or_path)
 
-    img_token = processor.tokenizer.convert_ids_to_tokens(model.config.image_token_index)
+    img_token = "<|image|>"
+    image_token_index = config.image_token_index
+    processor = LlavaProcessor.from_pretrained(
+        model_name_or_path,
+        image_token=img_token,
+        # llava의 img merge 단에 코드에서 애러가 발생함.
+        # patch_size=config.vision_config.patch_size,
+        # vision_feature_select_strategy=config.vision_feature_select_strategy,
+    )
 
+    logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
+    logger.info(f"pure_param: {get_model_param_count(model)}")
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
         # mplug-owl의 학습 법을 차용함.
@@ -213,9 +234,15 @@ def main(train_args: LlavaInsturctionArguments) -> None:
             continue
         parameter.requires_grad = False
 
-    # set logger
-    if GLOBAL_LOGGER and (train_args.local_rank == 0):
-        set_wandb()
+    logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
+
+    if is_liger_kernel_available():
+        logger.info("now you use liger kernel!")
+        from liger_kernel.transformers import apply_liger_kernel_to_llama
+        from liger_kernel.triton import apply_liger_triton_cache_manager
+
+        apply_liger_kernel_to_llama()
+        apply_liger_triton_cache_manager()
 
     # load dataset & preprocess
     data_dict = dict()
@@ -260,6 +287,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     train_dataset = None
     if train_args.do_train:
         train_dataset = collect_dataset(train_args.train_dataset_prefix)
+
         if (train_args.local_rank == 0) and train_dataset:
             logger.info("train_dataset")
             logger.info(train_dataset)
@@ -311,6 +339,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
             mode=train_args.torch_compile_mode,
             fullgraph=True,
         )
+    logger.info(f"""train_dataset_input_ids: {processor.tokenizer.decode(train_dataset[0]["input_ids"])}""")
 
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForImageCompletion(
@@ -325,6 +354,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         data_collator=collator,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
+        callbacks=[EmptyCacheCallback()],
     )
     if train_args.do_train and train_dataset:
         train(trainer)
@@ -364,8 +394,6 @@ def predict(trainer: Trainer, test_dataset: Optional[Union[Dataset, Dict[str, Da
 
         outputs = trainer.predict(part_dataset, metric_key_prefix=f"test/{dataset_name[start:]}")
         # NOTE: trainer.log를 사용하면 train/test 처럼 찍혀서 나와서 wandb로 직접 찍음
-        if GLOBAL_LOGGER:
-            GLOBAL_LOGGER.log(outputs.metrics)
         test_dataset_dict[dataset_name[start:end]] = part_dataset
 
 
@@ -379,20 +407,4 @@ if "__main__" in __name__:
     if train_args.run_name is not None:
         setproctitle(train_args.run_name)
 
-    check_wandb = ("wandb" in train_args.report_to) and (train_args.local_rank == 0)
-    if is_wandb_available() and check_wandb:
-        import wandb
-
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT"),
-            entity=os.getenv("WANDB_ENTITY"),
-            group=os.getenv("WANDB_RUN_GROUP"),
-            name=train_args.run_name,
-            save_code=True,
-        )
-        GLOBAL_LOGGER = wandb
-
     main(train_args)
-
-    if GLOBAL_LOGGER:
-        GLOBAL_LOGGER.finish()
