@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
@@ -29,9 +29,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class LlavaPretrainingArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
-        default=None,
-        metadata={"help": "The name of the dataset to use (via the datasets library)."},
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
+
     preprocessing_num_workers: int = field(
         default=4,
         metadata={"help": "The number of processes to use for the preprocessing."},
@@ -44,6 +44,7 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+
     train_dataset_prefix: List[str] = field(
         default="train",
         metadata={"help": ""},
@@ -56,13 +57,9 @@ class LlavaPretrainingArguments(TrainingArguments):
         default="eval_other",
         metadata={"help": ""},
     )
-    data_truncate_map: Dict[dict] = field(
-        default=None,
-    )
-    split_valid: bool = field(
-        default=False,
-        metadata={"help": ""},
-    )
+
+    data_truncate_map: Optional[Union[dict, str]] = field(default=None)
+
     cache_file_name: str = field(
         default=None,
         metadata={"help": "Path to cached file name"},
@@ -77,6 +74,10 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else None
 
 
 def main(train_args: LlavaPretrainingArguments) -> None:
@@ -147,14 +148,14 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         }
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls, valid_dataset_ls, test_dataset_ls = list()
-        for datasets_name in train_args.dataset_repo_ls:
-            logger.info(f"load-{datasets_name}")
-            datasets = load_dataset(datasets_name)
+        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+        for repo_name in train_args.dataset_repo_ls:
+            logger.info(f"load-{repo_name}")
+            datasets = load_dataset(repo_name)
 
-            if datasets_name in train_args.data_truncate_map:
-                for data_type in train_args.data_truncate_map[datasets_name]:
-                    truncate_size = train_args.data_truncate_map[datasets_name][data_type]
+            if repo_name in train_args.data_truncate_map:
+                for data_type in train_args.data_truncate_map[repo_name]:
+                    truncate_size = train_args.data_truncate_map[repo_name][data_type]
                     data = datasets[data_type].shuffle()
                     if len(data) <= truncate_size:
                         continue
@@ -166,11 +167,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     train_args.cache_dir,
                     f"{name}-{x}_{train_args.cache_file_name}",
                 )
-                name = datasets_name.split("/")[-1]
+                name = repo_name.split("/")[-1]
                 train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
 
             # DatasetsDict이라서 이런식으로 해줘야 함.
-            column_names = set(sum(datasets.column_names.values(), []))
             with train_args.main_process_first(desc="data preprocess"):
                 datasets = datasets.map(
                     preprocessor,
@@ -179,9 +179,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     batched=train_args.preprocessing_batched,
                     cache_file_names=train_args.cache_file_name,
                     batch_size=train_args.preprocessing_batch_size,
-                    remove_columns=column_names,
-                    desc=f"preprocess-{datasets_name}",
+                    remove_columns=set(sum(datasets.column_names.values(), [])),
+                    desc=f"preprocess-{repo_name}",
                 )
+                datasets.set_format("pt")
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     train_dataset_ls.append(datasets[dataset_key])
@@ -190,14 +191,28 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
                     test_dataset_ls.append(datasets[dataset_key])
 
-        train_dataset = concatenate_datasets(train_dataset_ls) if train_dataset_ls else None
-        valid_dataset = concatenate_datasets(valid_dataset_ls) if valid_dataset_ls else None
-        test_dataset = concatenate_datasets(test_dataset_ls) if test_dataset_ls else None
+        train_dataset = None
+        if train_dataset_ls:
+            train_dataset = concatenate_datasets(train_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"train_dataset:\n{train_dataset}")
+
+        valid_dataset = None
+        if valid_dataset_ls:
+            valid_dataset = concatenate_datasets(valid_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"valid_dataset:\n{valid_dataset}")
+
+        test_dataset = None
+        if test_dataset_ls:
+            test_dataset = concatenate_datasets(test_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"test_dataset:\n{test_dataset}")
 
         return (train_dataset, valid_dataset, test_dataset)
 
     # load model
-    model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
+    model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
     processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
