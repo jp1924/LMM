@@ -2,10 +2,10 @@ import json
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
@@ -15,8 +15,6 @@ from transformers import (
     LlavaProcessor,
     Trainer,
     TrainingArguments,
-    is_torch_xla_available,
-    is_wandb_available,
     set_seed,
 )
 from transformers import logging as hf_logging
@@ -58,13 +56,8 @@ class LlavaPretrainingArguments(TrainingArguments):
         default="eval_other",
         metadata={"help": ""},
     )
-    valid_exclude_ls: List[str] = field(
-        default="",
-        metadata={"help": ""},
-    )
-    valid_truncate_num: int = field(
-        default=3000,
-        metadata={"help": ""},
+    data_truncate_map: Dict[dict] = field(
+        default=None,
     )
     split_valid: bool = field(
         default=False,
@@ -84,14 +77,6 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
     )
-    wandb_code_log_dir: str = field(
-        default=None,
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
-    )
-
-
-global GLOBAL_LOGGER
-GLOBAL_LOGGER = None
 
 
 def main(train_args: LlavaPretrainingArguments) -> None:
@@ -161,46 +146,55 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             train_args.length_column_name: length_ls,
         }
 
-    def collect_dataset(prefix_ls: List[str]) -> Optional[Dataset]:
-        if not prefix_ls:
-            return None
+    def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = list()
+        for datasets_name in train_args.dataset_repo_ls:
+            logger.info(f"load-{datasets_name}")
+            datasets = load_dataset(datasets_name)
 
-        data_ls = list()
-        for prefix in prefix_ls:
-            check_key: str = lambda key: (prefix in key)  # noqa: E731
-            filter_data = [
-                concatenate_datasets(data_dict.pop(key)) for key in list(data_dict.keys()) if check_key(key)
-            ]
-            data_ls.extend(filter_data)
-        dataset = concatenate_datasets(data_ls)
-        dataset.set_format("torch")
+            if datasets_name in train_args.data_truncate_map:
+                for data_type in train_args.data_truncate_map[datasets_name]:
+                    truncate_size = train_args.data_truncate_map[datasets_name][data_type]
+                    data = datasets[data_type].shuffle()
+                    if len(data) <= truncate_size:
+                        continue
 
-        return dataset
+                    datasets[data_type] = data.select(range(truncate_size))
 
-    def set_wandb() -> None:
-        # TODO: 이건 나중에 args로 바꿀 것
-        GLOBAL_LOGGER.run.log_code(
-            train_args.wandb_code_log_dir,
-            include_fn=lambda path: path.endswith(".py") or path.endswith(".json"),
-        )
-        # logging args
-        combined_dict = {**train_args.to_dict()}
-        if hasattr(model, "config") and model.config is not None:
-            model_config = model.config.to_dict()
-            combined_dict = {**model_config, **combined_dict}
+            if train_args.cache_file_name:
+                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
+                    train_args.cache_dir,
+                    f"{name}-{x}_{train_args.cache_file_name}",
+                )
+                name = datasets_name.split("/")[-1]
+                train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
 
-        GLOBAL_LOGGER.config.update(combined_dict, allow_val_change=True)
+            # DatasetsDict이라서 이런식으로 해줘야 함.
+            column_names = set(sum(datasets.column_names.values(), []))
+            with train_args.main_process_first(desc="data preprocess"):
+                datasets = datasets.map(
+                    preprocessor,
+                    num_proc=train_args.preprocessing_num_workers,
+                    load_from_cache_file=True,
+                    batched=train_args.preprocessing_batched,
+                    cache_file_names=train_args.cache_file_name,
+                    batch_size=train_args.preprocessing_batch_size,
+                    remove_columns=column_names,
+                    desc=f"preprocess-{datasets_name}",
+                )
+            for dataset_key in datasets:
+                if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
+                    train_dataset_ls.append(datasets[dataset_key])
+                if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
+                    valid_dataset_ls.append(datasets[dataset_key])
+                if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
+                    test_dataset_ls.append(datasets[dataset_key])
 
-        # set default metrics
-        if getattr(GLOBAL_LOGGER, "define_metric", None):
-            GLOBAL_LOGGER.define_metric("train/global_step")
-            GLOBAL_LOGGER.define_metric("*", step_metric="train/global_step", step_sync=True)
+        train_dataset = concatenate_datasets(train_dataset_ls) if train_dataset_ls else None
+        valid_dataset = concatenate_datasets(valid_dataset_ls) if valid_dataset_ls else None
+        test_dataset = concatenate_datasets(test_dataset_ls) if test_dataset_ls else None
 
-        # set model watch
-        _watch_model = os.getenv("WANDB_WATCH", "false")
-        if not is_torch_xla_available() and _watch_model in ("all", "parameters", "gradients"):
-            GLOBAL_LOGGER.watch(model, log=_watch_model, log_freq=max(100, train_args.logging_steps))
-        GLOBAL_LOGGER.run._label(code="transformers_trainer")
+        return (train_dataset, valid_dataset, test_dataset)
 
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
@@ -215,96 +209,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             continue
         parameter.requires_grad = False
 
-    # set logger
-    if GLOBAL_LOGGER and (train_args.local_rank == 0):
-        set_wandb()
-
     # load dataset & preprocess
-    data_dict = dict()
-    for dataset_name in train_args.dataset_repo_ls:
-        logger.info(f"load-{dataset_name}")
-        dataset = load_dataset(dataset_name)
-
-        # DatasetDict이라서 이런식으로 해줘야 함.
-        column_names = set(sum(dataset.column_names.values(), []))
-        with train_args.main_process_first(desc="data preprocess"):
-            cache_file_name = None
-            if train_args.cache_file_name:
-                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
-                    train_args.cache_dir,
-                    f"{name}-{x}_{train_args.cache_file_name}",
-                )
-                name = dataset_name.split("/")[-1]
-                cache_file_name = {x: get_cache_path(x) for x in dataset}
-
-            dataset = dataset.map(
-                preprocessor,
-                num_proc=train_args.preprocessing_num_workers,
-                load_from_cache_file=True,
-                batched=train_args.preprocessing_batched,
-                cache_file_names=cache_file_name,
-                batch_size=train_args.preprocessing_batch_size,
-                remove_columns=column_names,
-                desc=f"preprocess-{dataset_name}",
-            )
-
-        for data_key in dataset:
-            if data_key not in data_dict:
-                data_dict[data_key] = []
-
-            specific_dataset = dataset[data_key]
-
-            added_data = [f"{dataset_name}-{data_key}"] * len(specific_dataset)
-            specific_dataset = specific_dataset.add_column("dataset_name", added_data)
-
-            data_dict[data_key].append(specific_dataset)
-
-    train_dataset = None
-    if train_args.do_train:
-        train_dataset = collect_dataset(train_args.train_dataset_prefix)
-        if (train_args.local_rank == 0) and train_dataset:
-            logger.info("train_dataset")
-            logger.info(train_dataset)
-
-    valid_dataset = None
-    if train_args.do_eval:
-        valid_dataset = collect_dataset(train_args.valid_dataset_prefix)
-
-        valid_dataset_dict = dict()
-        valid_repo_ls = valid_dataset["dataset_name"]
-        valid_exclude_ls = train_args.valid_exclude_ls or []
-        if train_args.split_valid:
-            for dataset_name in set(valid_repo_ls):
-                part_idx = [idx for idx, x in enumerate(valid_repo_ls) if x == dataset_name]
-                part_dataset = valid_dataset.select(part_idx, keep_in_memory=False)
-
-                # 'jp1924/KconfSpeech-validation'
-                start = dataset_name.rindex("/") + 1
-                end = dataset_name.rindex("-")
-
-                if dataset_name[start:end] in valid_exclude_ls:
-                    continue
-
-                if len(part_dataset) > train_args.valid_truncate_num:
-                    part_dataset = part_dataset.shuffle(train_args.seed)
-                    part_dataset = part_dataset.select(range(train_args.valid_truncate_num))
-
-                if (train_args.local_rank == 0) and valid_dataset:
-                    logger.info(f"{dataset_name[start:end]}-valid_dataset")
-                    logger.info(part_dataset)
-                valid_dataset_dict[dataset_name[start:end]] = part_dataset
-            valid_dataset = valid_dataset_dict
-        else:
-            if (train_args.local_rank == 0) and valid_dataset:
-                logger.info("valid_dataset")
-                logger.info(valid_dataset)
-
-    test_dataset = None
-    if train_args.do_predict:
-        test_dataset = collect_dataset(train_args.test_dataset_prefix)
-        if (train_args.local_rank == 0) and test_dataset:
-            logger.info("test_dataset")
-            logger.info(test_dataset)
+    train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     if train_args.torch_compile:
         model = torch.compile(
@@ -380,20 +286,4 @@ if "__main__" in __name__:
     if train_args.run_name is not None:
         setproctitle(train_args.run_name)
 
-    check_wandb = ("wandb" in train_args.report_to) and (train_args.local_rank == 0)
-    if is_wandb_available() and check_wandb:
-        import wandb
-
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT"),
-            entity=os.getenv("WANDB_ENTITY"),
-            group=os.getenv("WANDB_RUN_GROUP"),
-            name=train_args.run_name,
-            save_code=True,
-        )
-        GLOBAL_LOGGER = wandb
-
     main(train_args)
-
-    if GLOBAL_LOGGER:
-        GLOBAL_LOGGER.finish()
