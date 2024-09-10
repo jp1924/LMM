@@ -214,18 +214,15 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
-    processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    img_token = processor.tokenizer.convert_ids_to_tokens(model.config.image_token_index)
+    img_token = "<|image|>"
+    processor = LlavaProcessor.from_pretrained(model_name_or_path, image_token=img_token)
+    image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
 
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
-        if name not in ["language_model"]:
-            continue
-        parameter.requires_grad = False
-
-    # load dataset & preprocess
-    train_dataset, valid_dataset, test_dataset = prepare_datasets()
+        if name in ["language_model"]:
+            parameter.requires_grad = False
 
     if train_args.torch_compile:
         model = torch.compile(
@@ -235,11 +232,17 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             fullgraph=True,
         )
 
+    # load dataset & preprocess
+    train_dataset, valid_dataset, test_dataset = prepare_datasets()
+
+    # load collator
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForCompletionOnlyLM(
         tokenizer=processor.tokenizer,
         response_template=response_template,
     )
+
+    # load trainer
     trainer = Trainer(
         model=model,
         args=train_args,
@@ -255,7 +258,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         valid(trainer)
 
     if train_args.do_predict and test_dataset:
-        predict(trainer, test_dataset)
+        logger.info("do_predict 코드는 아직 작성 중")
 
 
 def train(trainer: Trainer) -> None:
@@ -272,28 +275,12 @@ def valid(trainer: Trainer, valid_datasets: Optional[Union[Dataset, Dict[str, Da
     trainer.evaluate(valid_datasets)
 
 
-@torch.no_grad()
-def predict(trainer: Trainer, test_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None) -> None:
-    test_dataset_dict = dict()
-    test_name_ls = test_dataset["dataset_name"]
-    for dataset_name in set(test_name_ls):
-        part_idx = [idx for idx, x in enumerate(test_name_ls) if x == dataset_name]
-        part_dataset = test_dataset.select(part_idx, keep_in_memory=False)
-
-        # 'jp1924/KconfSpeech-validation'
-        start = dataset_name.rindex("/") + 1
-        end = dataset_name.rindex("-")
-
-        outputs = trainer.predict(part_dataset, metric_key_prefix=f"test/{dataset_name[start:]}")
-        # NOTE: trainer.log를 사용하면 train/test 처럼 찍혀서 나와서 wandb로 직접 찍음
-        if GLOBAL_LOGGER:
-            GLOBAL_LOGGER.log(outputs.metrics)
-        test_dataset_dict[dataset_name[start:end]] = part_dataset
-
-
 if "__main__" in __name__:
     parser = HfArgumentParser([LlavaPretrainingArguments])
-    train_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    train_args, remain_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+
+    if remain_args:
+        logger.info(f"remain_args: {remain_args}")
 
     if train_args.seed is not None:
         set_seed(train_args.seed)

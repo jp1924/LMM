@@ -2,23 +2,18 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
-from deepspeed.accelerator import get_accelerator
-
-# from peft import LoraConfig, TaskType, get_peft_model
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
 from transformers import (
     HfArgumentParser,
-    LlavaConfig,
     LlavaForConditionalGeneration,
     LlavaProcessor,
     Trainer,
-    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -36,9 +31,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class LlavaInsturctionArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
-        default=None,
-        metadata={"help": "The name of the dataset to use (via the datasets library)."},
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
+
     preprocessing_num_workers: int = field(
         default=4,
         metadata={"help": "The number of processes to use for the preprocessing."},
@@ -51,6 +46,7 @@ class LlavaInsturctionArguments(TrainingArguments):
         default=True,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+
     train_dataset_prefix: List[str] = field(
         default="train",
         metadata={"help": ""},
@@ -63,18 +59,9 @@ class LlavaInsturctionArguments(TrainingArguments):
         default="eval_other",
         metadata={"help": ""},
     )
-    valid_exclude_ls: List[str] = field(
-        default="",
-        metadata={"help": ""},
-    )
-    valid_truncate_num: int = field(
-        default=3000,
-        metadata={"help": ""},
-    )
-    split_valid: bool = field(
-        default=False,
-        metadata={"help": ""},
-    )
+
+    data_truncate_map: Optional[Union[dict, str]] = field(default=None)
+
     cache_file_name: str = field(
         default=None,
         metadata={"help": "Path to cached file name"},
@@ -89,10 +76,10 @@ class LlavaInsturctionArguments(TrainingArguments):
         default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
     )
-    wandb_code_log_dir: str = field(
-        default=None,
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
-    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else None
 
 
 class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
@@ -107,13 +94,6 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
         if pixel_values:
             batch["pixel_values"] = torch.stack(pixel_values)
         return batch
-
-
-class EmptyCacheCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % 5 == 0:
-            get_accelerator().empty_cache()
-            torch.cuda.empty_cache()
 
 
 def main(train_args: LlavaInsturctionArguments) -> None:
@@ -132,7 +112,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                         }
                         for chat in conversations
                     ]
-                except:
+                except BaseException as e:  # noqa: F841
                     continue
 
         try:
@@ -192,47 +172,85 @@ def main(train_args: LlavaInsturctionArguments) -> None:
             train_args.length_column_name: length_ls,
         }
 
-    def collect_dataset(prefix_ls: List[str]) -> Optional[Dataset]:
-        if not prefix_ls:
-            return None
+    def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
+        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+        for repo_name in train_args.dataset_repo_ls:
+            logger.info(f"load-{repo_name}")
+            datasets = load_dataset(repo_name)
 
-        data_ls = list()
-        for prefix in prefix_ls:
-            check_key: str = lambda key: (prefix in key)  # noqa: E731
-            filter_data = [
-                concatenate_datasets(data_dict.pop(key)) for key in list(data_dict.keys()) if check_key(key)
-            ]
-            data_ls.extend(filter_data)
-        dataset = concatenate_datasets(data_ls)
-        dataset.set_format("torch")
+            if repo_name in train_args.data_truncate_map:
+                for data_type in train_args.data_truncate_map[repo_name]:
+                    truncate_size = train_args.data_truncate_map[repo_name][data_type]
+                    data = datasets[data_type].shuffle()
+                    if len(data) <= truncate_size:
+                        continue
 
-        return dataset
+                    datasets[data_type] = data.select(range(truncate_size))
+
+            if train_args.cache_file_name:
+                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
+                    train_args.cache_dir,
+                    f"{name}-{x}_{train_args.cache_file_name}",
+                )
+                name = repo_name.split("/")[-1]
+                train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
+
+            # DatasetsDict이라서 이런식으로 해줘야 함.
+            with train_args.main_process_first(desc="data preprocess"):
+                datasets = datasets.map(
+                    preprocessor,
+                    num_proc=train_args.preprocessing_num_workers,
+                    load_from_cache_file=True,
+                    batched=train_args.preprocessing_batched,
+                    cache_file_names=train_args.cache_file_name,
+                    batch_size=train_args.preprocessing_batch_size,
+                    remove_columns=set(sum(datasets.column_names.values(), [])),
+                    desc=f"preprocess-{repo_name}",
+                )
+                datasets.set_format("pt")
+            for dataset_key in datasets:
+                if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
+                    train_dataset_ls.append(datasets[dataset_key])
+                if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
+                    valid_dataset_ls.append(datasets[dataset_key])
+                if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
+                    test_dataset_ls.append(datasets[dataset_key])
+
+        train_dataset = None
+        if train_dataset_ls:
+            train_dataset = concatenate_datasets(train_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"train_dataset:\n{train_dataset}")
+
+        valid_dataset = None
+        if valid_dataset_ls:
+            valid_dataset = concatenate_datasets(valid_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"valid_dataset:\n{valid_dataset}")
+
+        test_dataset = None
+        if test_dataset_ls:
+            test_dataset = concatenate_datasets(test_dataset_ls)
+            if train_args.local_rank <= 0:
+                logger.info(f"test_dataset:\n{test_dataset}")
+
+        return (train_dataset, valid_dataset, test_dataset)
 
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
-    model.language_model.config.use_cache = False
-    config = LlavaConfig.from_pretrained(model_name_or_path)
 
     img_token = "<|image|>"
-    image_token_index = config.image_token_index
-    processor = LlavaProcessor.from_pretrained(
-        model_name_or_path,
-        image_token=img_token,
-        # llava의 img merge 단에 코드에서 애러가 발생함.
-        # patch_size=config.vision_config.patch_size,
-        # vision_feature_select_strategy=config.vision_feature_select_strategy,
-    )
+    processor = LlavaProcessor.from_pretrained(model_name_or_path, image_token=img_token)
+    image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
     logger.info(f"pure_param: {get_model_param_count(model)}")
+
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
-        # mplug-owl의 학습 법을 차용함.
-        if name not in ["multi_modal_projector", "vision_tower"]:
-            # grad true
-            continue
-        parameter.requires_grad = False
+        if name in ["multi_modal_projector", "vision_tower"]:
+            parameter.requires_grad = False
 
     logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -244,94 +262,6 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         apply_liger_kernel_to_llama()
         apply_liger_triton_cache_manager()
 
-    # load dataset & preprocess
-    data_dict = dict()
-    for dataset_name in train_args.dataset_repo_ls:
-        logger.info(f"load-{dataset_name}")
-        dataset = load_dataset(dataset_name)
-
-        # DatasetDict이라서 이런식으로 해줘야 함.
-        column_names = set(sum(dataset.column_names.values(), []))
-        with train_args.main_process_first(desc="data preprocess"):
-            cache_file_name = None
-            if train_args.cache_file_name:
-                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
-                    train_args.cache_dir,
-                    f"{name}-{x}_{train_args.cache_file_name}",
-                )
-                name = dataset_name.split("/")[-1]
-                cache_file_name = {x: get_cache_path(x) for x in dataset}
-
-            dataset = dataset.map(
-                preprocessor,
-                num_proc=train_args.preprocessing_num_workers,
-                load_from_cache_file=True,
-                batched=train_args.preprocessing_batched,
-                cache_file_names=cache_file_name,
-                batch_size=train_args.preprocessing_batch_size,
-                remove_columns=column_names,
-                desc=f"preprocess-{dataset_name}",
-            )
-
-        for data_key in dataset:
-            if data_key not in data_dict:
-                data_dict[data_key] = []
-
-            specific_dataset = dataset[data_key]
-
-            added_data = [f"{dataset_name}-{data_key}"] * len(specific_dataset)
-            specific_dataset = specific_dataset.add_column("dataset_name", added_data)
-
-            data_dict[data_key].append(specific_dataset)
-
-    train_dataset = None
-    if train_args.do_train:
-        train_dataset = collect_dataset(train_args.train_dataset_prefix)
-
-        if (train_args.local_rank == 0) and train_dataset:
-            logger.info("train_dataset")
-            logger.info(train_dataset)
-
-    valid_dataset = None
-    if train_args.do_eval:
-        valid_dataset = collect_dataset(train_args.valid_dataset_prefix)
-
-        valid_dataset_dict = dict()
-        valid_repo_ls = valid_dataset["dataset_name"]
-        valid_exclude_ls = train_args.valid_exclude_ls or []
-        if train_args.split_valid:
-            for dataset_name in set(valid_repo_ls):
-                part_idx = [idx for idx, x in enumerate(valid_repo_ls) if x == dataset_name]
-                part_dataset = valid_dataset.select(part_idx, keep_in_memory=False)
-
-                # 'jp1924/KconfSpeech-validation'
-                start = dataset_name.rindex("/") + 1
-                end = dataset_name.rindex("-")
-
-                if dataset_name[start:end] in valid_exclude_ls:
-                    continue
-
-                if len(part_dataset) > train_args.valid_truncate_num:
-                    part_dataset = part_dataset.shuffle(train_args.seed)
-                    part_dataset = part_dataset.select(range(train_args.valid_truncate_num))
-
-                if (train_args.local_rank == 0) and valid_dataset:
-                    logger.info(f"{dataset_name[start:end]}-valid_dataset")
-                    logger.info(part_dataset)
-                valid_dataset_dict[dataset_name[start:end]] = part_dataset
-            valid_dataset = valid_dataset_dict
-        else:
-            if (train_args.local_rank == 0) and valid_dataset:
-                logger.info("valid_dataset")
-                logger.info(valid_dataset)
-
-    test_dataset = None
-    if train_args.do_predict:
-        test_dataset = collect_dataset(train_args.test_dataset_prefix)
-        if (train_args.local_rank == 0) and test_dataset:
-            logger.info("test_dataset")
-            logger.info(test_dataset)
-
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -339,14 +269,18 @@ def main(train_args: LlavaInsturctionArguments) -> None:
             mode=train_args.torch_compile_mode,
             fullgraph=True,
         )
-    logger.info(f"""train_dataset_input_ids: {processor.tokenizer.decode(train_dataset[0]["input_ids"])}""")
 
+    # load datasets
+    train_dataset, valid_dataset, test_dataset = prepare_datasets()
+
+    # load collator
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
         image_processor=processor.image_processor,
         response_template=response_template,
     )
+    # load trainer
     trainer = Trainer(
         model=model,
         args=train_args,
@@ -354,7 +288,6 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         data_collator=collator,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
-        callbacks=[EmptyCacheCallback()],
     )
     if train_args.do_train and train_dataset:
         train(trainer)
@@ -363,7 +296,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         valid(trainer)
 
     if train_args.do_predict and test_dataset:
-        predict(trainer, test_dataset)
+        logger.info("do_predict 코드는 아직 작성 중")
 
 
 def train(trainer: Trainer) -> None:
@@ -380,26 +313,12 @@ def valid(trainer: Trainer, valid_datasets: Optional[Union[Dataset, Dict[str, Da
     trainer.evaluate(valid_datasets)
 
 
-@torch.no_grad()
-def predict(trainer: Trainer, test_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None) -> None:
-    test_dataset_dict = dict()
-    test_name_ls = test_dataset["dataset_name"]
-    for dataset_name in set(test_name_ls):
-        part_idx = [idx for idx, x in enumerate(test_name_ls) if x == dataset_name]
-        part_dataset = test_dataset.select(part_idx, keep_in_memory=False)
-
-        # 'jp1924/KconfSpeech-validation'
-        start = dataset_name.rindex("/") + 1
-        end = dataset_name.rindex("-")
-
-        outputs = trainer.predict(part_dataset, metric_key_prefix=f"test/{dataset_name[start:]}")
-        # NOTE: trainer.log를 사용하면 train/test 처럼 찍혀서 나와서 wandb로 직접 찍음
-        test_dataset_dict[dataset_name[start:end]] = part_dataset
-
-
 if "__main__" in __name__:
     parser = HfArgumentParser([LlavaInsturctionArguments])
-    train_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    train_args, remain_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+
+    if remain_args:
+        logger.info(f"remain_args: {remain_args}")
 
     if train_args.seed is not None:
         set_seed(train_args.seed)

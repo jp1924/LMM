@@ -15,8 +15,6 @@ from transformers import (
     CLIPVisionModel,
     LlavaConfig,
     LlavaForConditionalGeneration,
-    LlavaNextImageProcessor,
-    LlavaNextProcessor,
     LlavaProcessor,
 )
 
