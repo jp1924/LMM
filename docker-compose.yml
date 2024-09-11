@@ -6,9 +6,9 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./:/root/workspace
-      - /home/jsb193/.cache:/root/.cache
-      - /home/jsb193/workspace/llava/.vscode:/root/.vscode
-      - /home/jsb193/output_dir:/root/output_dir
+      - ./.vscode:/root/.vscode
+      - ~/.cache:/root/.cache
+      - ~/output_dir:/root/output_dir
     tty: true
     shm_size: 126G
     environment:
