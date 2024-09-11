@@ -31,7 +31,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class LlavaInsturctionArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
 
     preprocessing_num_workers: int = field(
@@ -49,24 +50,26 @@ class LlavaInsturctionArguments(TrainingArguments):
 
     train_dataset_prefix: List[str] = field(
         default="train",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     valid_dataset_prefix: List[str] = field(
         default="validation",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     test_dataset_prefix: List[str] = field(
         default="eval_other",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
+    )
+    data_truncate_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
     )
 
-    data_truncate_map: Optional[Union[dict, str]] = field(default=None)
-
-    cache_file_name: str = field(
+    cache_file_name: Optional[str] = field(
         default=None,
         metadata={"help": "Path to cached file name"},
     )
-    cache_dir: str = field(
+    cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
@@ -90,9 +93,12 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         input_ids = [{"input_ids": example["input_ids"]} for example in examples]
         pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"] is not None]
+
         batch = super().torch_call(input_ids)
+
         if pixel_values:
             batch["pixel_values"] = torch.stack(pixel_values)
+
         return batch
 
 
@@ -245,11 +251,10 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
-    logger.info(f"pure_param: {get_model_param_count(model)}")
 
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
-        if name in ["multi_modal_projector", "vision_tower"]:
+        if name in ["multi_modal_projector"]:
             parameter.requires_grad = False
 
     logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")

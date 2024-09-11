@@ -18,6 +18,7 @@ from transformers import (
     set_seed,
 )
 from transformers import logging as hf_logging
+from transformers.trainer_pt_utils import get_model_param_count
 
 
 hf_logging.set_verbosity_info()
@@ -29,7 +30,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class LlavaPretrainingArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
 
     preprocessing_num_workers: int = field(
@@ -47,24 +49,26 @@ class LlavaPretrainingArguments(TrainingArguments):
 
     train_dataset_prefix: List[str] = field(
         default="train",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     valid_dataset_prefix: List[str] = field(
         default="validation",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     test_dataset_prefix: List[str] = field(
         default="eval_other",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
+    )
+    data_truncate_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
     )
 
-    data_truncate_map: Optional[Union[dict, str]] = field(default=None)
-
-    cache_file_name: str = field(
+    cache_file_name: Optional[str] = field(
         default=None,
         metadata={"help": "Path to cached file name"},
     )
-    cache_dir: str = field(
+    cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
@@ -92,6 +96,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 "input_ids": [],
                 train_args.length_column_name: [],
             }
+
         final_conver_ls = list()
         if "caption" in example:
             caption_ls = example["caption"]
@@ -128,23 +133,32 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         else:
             exit("지원하는 않는 데이터 타입, 종료함.")
 
-        pixel_value_ls = list()
-        input_id_ls = list()
-        length_ls = list()
+        finish_pixel_value_ls = finish_input_id_ls = finish_length_ls = list()
         for image, conversation in zip(image_ls, final_conver_ls):
-            outputs = processor(
-                images=image,
-                text=processor.apply_chat_template(conversation, img_token=img_token),
-                return_tensors="np",
-            )
-            pixel_value_ls.append(outputs["pixel_values"][0])
-            input_id_ls.append(outputs["input_ids"][0])
-            length_ls.append(outputs["input_ids"][0].shape[0])
+            chat = processor.apply_chat_template(conversation, img_token=img_token)
+            if image:
+                outputs = processor(
+                    images=image,
+                    text=chat,
+                    return_tensors="np",
+                )
+            pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
+
+            if image and (image_token_index not in input_ids):
+                break
+            elif (image is None) and (image_token_index in input_ids):
+                break
+            elif image and (image_token_index == input_ids).sum() != 1:
+                break
+
+            finish_pixel_value_ls.append(pixel_values)
+            finish_input_id_ls.append(input_ids)
+            finish_length_ls.append(input_ids.shape[0])
 
         return {
-            "pixel_values": pixel_value_ls,
-            "input_ids": input_id_ls,
-            train_args.length_column_name: length_ls,
+            "pixel_values": finish_pixel_value_ls,
+            "input_ids": finish_input_id_ls,
+            train_args.length_column_name: finish_length_ls,
         }
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
@@ -183,6 +197,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     desc=f"preprocess-{repo_name}",
                 )
                 datasets.set_format("pt")
+
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     train_dataset_ls.append(datasets[dataset_key])
@@ -219,10 +234,14 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     processor = LlavaProcessor.from_pretrained(model_name_or_path, image_token=img_token)
     image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
 
+    logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
+
     for name, parameter in model.named_parameters():
         name = name.split(".")[0]
-        if name in ["language_model"]:
+        if name in ["language_model", "vision_tower"]:
             parameter.requires_grad = False
+
+    logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
     if train_args.torch_compile:
         model = torch.compile(
@@ -251,6 +270,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
     )
+
     if train_args.do_train and train_dataset:
         train(trainer)
 
