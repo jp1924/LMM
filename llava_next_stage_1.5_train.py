@@ -17,10 +17,10 @@ from transformers import (
     LlavaNextProcessor,
     Trainer,
     TrainingArguments,
-    is_liger_kernel_available,
     set_seed,
 )
 from transformers import logging as hf_logging
+from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -32,7 +32,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class LlavaPretrainingArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
 
     preprocessing_num_workers: int = field(
@@ -50,24 +51,26 @@ class LlavaPretrainingArguments(TrainingArguments):
 
     train_dataset_prefix: List[str] = field(
         default="train",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     valid_dataset_prefix: List[str] = field(
         default="validation",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     test_dataset_prefix: List[str] = field(
         default="eval_other",
-        metadata={"help": ""},
+        metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
+    )
+    data_truncate_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
     )
 
-    data_truncate_map: Optional[Union[dict, str]] = field(default=None)
-
-    cache_file_name: str = field(
+    cache_file_name: Optional[str] = field(
         default=None,
         metadata={"help": "Path to cached file name"},
     )
-    cache_dir: str = field(
+    cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
@@ -76,6 +79,10 @@ class LlavaPretrainingArguments(TrainingArguments):
     model_name_or_path: str = field(
         default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
+    )
+    vision_learning_rate: float = field(
+        default=2e-6,
+        metadata={"help": "The initial learning rate for AdamW."},
     )
 
     def __post_init__(self):
@@ -263,7 +270,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     p for n, p in model.vision_tower.named_parameters() if (n in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": train_args.weight_decay,
-                "lr": train_args.learning_rate / 5,
+                "lr": train_args.vision_learning_rate,
             },
             {
                 "params": [
@@ -272,7 +279,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     if (n not in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": 0.0,
-                "lr": train_args.learning_rate / 5,
+                "lr": train_args.vision_learning_rate,
             },
         ]
 
@@ -305,12 +312,6 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         model_name_or_path, image_processor=image_processor, img_token=img_token
     )
     image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
-
-    for name, parameter in model.named_parameters():
-        name = name.split(".")[0]
-        if name not in ["language_model"]:
-            continue
-        parameter.requires_grad = False
 
     optimizers = (create_optimizer(), None)
 
