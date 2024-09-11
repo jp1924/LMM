@@ -19,10 +19,10 @@
     "editor.minimap.renderCharacters": false,
     "editor.minimap.enabled": false,
     "ruff.lint.args": [
-        "--config=/root/ruff.toml",
+        "--config=/root/workspace/ruff.toml",
     ],
     "ruff.format.args": [
-        "--config=/root/ruff.toml"
+        "--config=/root/workspace/ruff.toml"
     ],
     "files.refactoring.autoSave": true,
     "ruff.lint.preview": true,
