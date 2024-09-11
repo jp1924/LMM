@@ -23,6 +23,7 @@ from transformers.trainer_pt_utils import get_model_param_count
 
 hf_logging.set_verbosity_info()
 logger = hf_logging.get_logger("transformers")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -61,7 +62,11 @@ class LlavaPretrainingArguments(TrainingArguments):
     )
     data_truncate_map: Optional[Union[dict, str]] = field(
         default=None,
-        metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
+        metadata={"help": "A map to truncate part of the data. {'repo_name': {'train': 3000, 'validation': 1500}}."},
+    )
+    data_config_name_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to config_name of the data. {'repo_name': 'data_config_name'"},
     )
 
     cache_file_name: Optional[str] = field(
@@ -81,7 +86,8 @@ class LlavaPretrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else None
+        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
+        self.data_config_name_map = json.loads(self.data_config_name_map) if self.data_config_name_map else {}
 
 
 def main(train_args: LlavaPretrainingArguments) -> None:
@@ -135,20 +141,20 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
         finish_pixel_value_ls = finish_input_id_ls = finish_length_ls = list()
         for image, conversation in zip(image_ls, final_conver_ls):
-            chat = processor.apply_chat_template(conversation, img_token=img_token)
-            if image:
-                outputs = processor(
-                    images=image,
-                    text=chat,
-                    return_tensors="np",
-                )
+            chat = processor.apply_chat_template(conversation, img_token=processor.image_token)
+            outputs = processor(
+                images=image,
+                text=chat,
+                return_tensors="np",
+            )
+
             pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
 
             if image and (image_token_index not in input_ids):
                 break
             elif (image is None) and (image_token_index in input_ids):
                 break
-            elif image and (image_token_index == input_ids).sum() != 1:
+            elif image and ((image_token_index == input_ids).sum() / image_seq_length) != 1:
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -165,7 +171,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
-            datasets = load_dataset(repo_name)
+
+            name = train_args.data_config_name_map.get(repo_name)
+            datasets = load_dataset(repo_name, name)
 
             if repo_name in train_args.data_truncate_map:
                 for data_type in train_args.data_truncate_map[repo_name]:
@@ -229,10 +237,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
+    processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    img_token = "<|image|>"
-    processor = LlavaProcessor.from_pretrained(model_name_or_path, image_token=img_token)
-    image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
+    image_token_index, image_seq_length = model.config.image_token_index, model.config.image_seq_length
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -241,7 +248,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         if name in ["language_model", "vision_tower"]:
             parameter.requires_grad = False
 
-    logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
+    logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
     if train_args.torch_compile:
         model = torch.compile(

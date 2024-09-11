@@ -24,6 +24,7 @@ from transformers.utils import is_liger_kernel_available
 
 hf_logging.set_verbosity_info()
 logger = hf_logging.get_logger("transformers")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -62,7 +63,11 @@ class LlavaInsturctionArguments(TrainingArguments):
     )
     data_truncate_map: Optional[Union[dict, str]] = field(
         default=None,
-        metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
+        metadata={"help": "A map to truncate part of the data. {'repo_name': {'train': 3000, 'validation': 1500}}."},
+    )
+    data_config_name_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to config_name of the data. {'repo_name': 'data_config_name'"},
     )
 
     cache_file_name: Optional[str] = field(
@@ -82,7 +87,8 @@ class LlavaInsturctionArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else None
+        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
+        self.data_config_name_map = json.loads(self.data_config_name_map) if self.data_config_name_map else {}
 
 
 class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
@@ -138,17 +144,16 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         for image, conversation in zip(image_ls, conversations_ls):
             idx = 0
             while conversation[idx : idx + 2]:
-                text = processor.tokenizer.apply_chat_template(
-                    conversation[: idx + 2], img_token=img_token, tokenize=False
+                text = processor.apply_chat_template(
+                    conversation[: idx + 2],
+                    img_token=processor.image_token,
+                    tokenize=False,
                 )
-                if image:
-                    outputs = processor(
-                        images=image,
-                        text=text,
-                        return_tensors="np",
-                    )
-                else:
-                    outputs = processor.tokenizer(text, return_tensors="np")
+                outputs = processor(
+                    images=image,
+                    text=text,
+                    return_tensors="np",
+                )
 
                 pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
 
@@ -156,9 +161,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                     break
                 elif (image is None) and (image_token_index in input_ids):
                     break
-                # elif image and ((image_token_index == input_ids).sum() // 256) != 1:
-                elif image and (image_token_index == input_ids).sum() != 1:
-                    print(input_ids.tolist())
+                elif image and ((image_token_index == input_ids).sum() / image_seq_length) != 1:
                     break
 
                 pixel_value_ls.append(pixel_values)
@@ -182,7 +185,9 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
-            datasets = load_dataset(repo_name)
+
+            name = train_args.data_config_name_map.get(repo_name)
+            datasets = load_dataset(repo_name, name)
 
             if repo_name in train_args.data_truncate_map:
                 for data_type in train_args.data_truncate_map[repo_name]:
@@ -245,10 +250,9 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
+    processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    img_token = "<|image|>"
-    processor = LlavaProcessor.from_pretrained(model_name_or_path, image_token=img_token)
-    image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
+    image_token_index, image_seq_length = model.config.image_token_index, model.config.image_seq_length
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -261,11 +265,10 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
     if is_liger_kernel_available():
         logger.info("now you use liger kernel!")
-        from liger_kernel.transformers import apply_liger_kernel_to_llama
-        from liger_kernel.triton import apply_liger_triton_cache_manager
+        from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
 
-        apply_liger_kernel_to_llama()
-        apply_liger_triton_cache_manager()
+        model_type = model.language_model.config.model_type
+        _apply_liger_kernel(model_type)
 
     if train_args.torch_compile:
         model = torch.compile(
@@ -285,6 +288,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         image_processor=processor.image_processor,
         response_template=response_template,
     )
+
     # load trainer
     trainer = Trainer(
         model=model,
@@ -306,7 +310,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
 def train(trainer: Trainer) -> None:
     train_args: LlavaInsturctionArguments = trainer.args
-    trainer.train(resume_from_checkpoint=train_args.resume_from_checkpoint)
+    trainer.train(resume_from_checkpoint=train_args.resume_from_checkpsoint)
 
     save_dir = os.path.join(train_args.output_dir, "last_model")
     trainer.save_model(save_dir)
