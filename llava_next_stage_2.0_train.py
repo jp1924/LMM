@@ -17,6 +17,7 @@ from transformers import (
     LlavaNextProcessor,
     Trainer,
     TrainingArguments,
+    is_liger_kernel_available,
     set_seed,
 )
 from transformers import logging as hf_logging
@@ -89,12 +90,11 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
 
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         input_ids = [{"input_ids": example["input_ids"]} for example in examples]
-        pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"]]
-        image_sizes = [x["image_sizes"] for x in examples]
-
+        pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"] is not None]
         batch = super().torch_call(input_ids)
-        batch["pixel_values"] = torch.stack(self.image_processor._pad_for_batching(pixel_values))
-        batch["image_sizes"] = torch.stack(image_sizes)
+
+        if pixel_values:
+            batch["pixel_values"] = torch.stack(pixel_values)
 
         return batch
 
@@ -221,6 +221,82 @@ def main(train_args: LlavaInstructionArguments) -> None:
 
         return (train_dataset, valid_dataset, test_dataset)
 
+    def create_optimizer():
+        decay_parameters = Trainer.get_decay_parameter_names(model)
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in model.multi_modal_projector.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": train_args.weight_decay,
+                "lr": train_args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.multi_modal_projector.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": train_args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.language_model.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": train_args.weight_decay,
+                "lr": train_args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.language_model.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": train_args.learning_rate,
+            },
+            {
+                "params": [
+                    p for n, p in model.vision_tower.named_parameters() if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": train_args.weight_decay,
+                "lr": train_args.learning_rate / 5,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.vision_tower.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": train_args.learning_rate / 5,
+            },
+        ]
+
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(train_args, model)
+
+        if "params" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+
+        # Overwrite `model` in case it's created by `get_optimizer_cls_and_kwargs`
+        # e.g. for LOMO optimizer.
+        if "model" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+
+        # For layer-wise dummy optimizers we overwrite optimizer_grouped_parameters with `optimizer_dict`
+        # to avoid arguments conflicts.
+        if "optimizer_dict" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+        optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return optimizer
+
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
     model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path)
@@ -238,6 +314,14 @@ def main(train_args: LlavaInstructionArguments) -> None:
             continue
         parameter.requires_grad = False
 
+    optimizers = (create_optimizer(), None)
+    if is_liger_kernel_available():
+        logger.info("now you use liger kernel!")
+        from liger_kernel.transformers import apply_liger_kernel_to_llama
+        from liger_kernel.triton import apply_liger_triton_cache_manager
+
+        apply_liger_kernel_to_llama()
+        apply_liger_triton_cache_manager()
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -250,7 +334,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
 
     # load collator
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
-    collator = DataCollatorForCompletionOnlyLM(
+    collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
         image_processor=processor.image_processor,
         response_template=response_template,
@@ -261,6 +345,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
         model=model,
         args=train_args,
         tokenizer=processor,
+        # optimizers=optimizers,
         data_collator=collator,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
