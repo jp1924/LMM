@@ -39,6 +39,6 @@ deepspeed --include=localhost:0,1,2,3 --master_port=10234 \
     --tf32=true \
     --use_liger_kernel=false \
     --gradient_checkpointing=true \
-    --gradient_checkpointing_kwargs='{\"use_reentrant\": false}' \
+    --gradient_checkpointing_kwargs='{"use_reentrant": false}' \
     --group_by_length=false \
     --deepspeed=/root/workspace/ds_config/ZeRO_2_act_check.json
