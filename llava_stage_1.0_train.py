@@ -174,6 +174,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
             name = train_args.data_config_name_map.get(repo_name)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
+
             datasets = load_dataset(repo_name, name)
 
             for data_type in truncate_map:
