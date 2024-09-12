@@ -173,16 +173,18 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             logger.info(f"load-{repo_name}")
 
             name = train_args.data_config_name_map.get(repo_name)
+            truncate_map = train_args.data_truncate_map.get(repo_name, {})
             datasets = load_dataset(repo_name, name)
 
-            if repo_name in train_args.data_truncate_map:
-                for data_type in train_args.data_truncate_map[repo_name]:
-                    truncate_size = train_args.data_truncate_map[repo_name][data_type]
-                    data = datasets[data_type].shuffle()
-                    if len(data) <= truncate_size:
-                        continue
+            for data_type in truncate_map:
+                truncate_size = truncate_map[data_type]
+                data = datasets[data_type].shuffle()
+                if len(data) <= truncate_size:
+                    msg = f"{repo_name}의 {data_type}크기는 {len(data)}이지만, truncate_size는 {truncate_size} 크기를 조절하셈."
+                    logger.info(msg)
+                    continue
 
-                    datasets[data_type] = data.select(range(truncate_size))
+                datasets[data_type] = data.select(range(truncate_size))
 
             if train_args.cache_file_name:
                 get_cache_path: str = lambda x: os.path.join(  # noqa: E731
