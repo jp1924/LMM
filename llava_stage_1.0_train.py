@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -181,6 +182,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
 
+            start_time = time.time()
+
             config_name = train_args.data_config_name_map.get(repo_name)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
 
@@ -217,6 +220,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     desc=f"preprocess-{repo_name}",
                 )
                 datasets.set_format("pt")
+
+            logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
