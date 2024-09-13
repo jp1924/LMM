@@ -89,6 +89,10 @@ class LlavaPretrainingArguments(TrainingArguments):
         self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
         self.data_config_name_map = json.loads(self.data_config_name_map) if self.data_config_name_map else {}
 
+        self.train_dataset_prefix = self.train_dataset_prefix if self.train_dataset_prefix else []
+        self.valid_dataset_prefix = self.valid_dataset_prefix if self.valid_dataset_prefix else []
+        self.test_dataset_prefix = self.test_dataset_prefix if self.test_dataset_prefix else []
+
 
 def main(train_args: LlavaPretrainingArguments) -> None:
     def preprocessor(example: Dict[str, Union[List[Any], List[List[Any]]]]) -> Dict[str, List[Any]]:
@@ -139,9 +143,13 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         else:
             exit("지원하는 않는 데이터 타입, 종료함.")
 
-        finish_pixel_value_ls = finish_input_id_ls = finish_length_ls = list()
+        finish_pixel_value_ls, finish_input_id_ls, finish_length_ls = (list(), list(), list())
         for image, conversation in zip(image_ls, final_conver_ls):
-            chat = processor.apply_chat_template(conversation, img_token=processor.image_token)
+            chat = processor.tokenizer.apply_chat_template(
+                conversation,
+                img_token=processor.image_token,
+                tokenize=False,
+            )
             outputs = processor(
                 images=image,
                 text=chat,
@@ -154,7 +162,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 break
             elif (image is None) and (image_token_index in input_ids):
                 break
-            elif image and ((image_token_index == input_ids).sum() / image_seq_length) != 1:
+            # NOTE: 저거 256은 좀 수정해야함.
+            elif image and ((image_token_index == input_ids).sum() / 256) != 1:
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -172,10 +181,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
 
-            name = train_args.data_config_name_map.get(repo_name)
+            config_name = train_args.data_config_name_map.get(repo_name)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
 
-            datasets = load_dataset(repo_name, name)
+            datasets = load_dataset(repo_name, config_name)
 
             for data_type in truncate_map:
                 truncate_size = truncate_map[data_type]
@@ -187,13 +196,13 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
                 datasets[data_type] = data.select(range(truncate_size))
 
+            cache_file_name = None
             if train_args.cache_file_name:
                 get_cache_path: str = lambda x: os.path.join(  # noqa: E731
                     train_args.cache_dir,
-                    f"{name}-{x}_{train_args.cache_file_name}",
+                    f"""{repo_name.split("/")[-1]}-{x}_{train_args.cache_file_name}""",
                 )
-                name = repo_name.split("/")[-1]
-                train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
+                cache_file_name = {x: get_cache_path(x) for x in datasets}
 
             # DatasetsDict이라서 이런식으로 해줘야 함.
             with train_args.main_process_first(desc="data preprocess"):
@@ -202,7 +211,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     num_proc=train_args.preprocessing_num_workers,
                     load_from_cache_file=True,
                     batched=train_args.preprocessing_batched,
-                    cache_file_names=train_args.cache_file_name,
+                    cache_file_names=cache_file_name,
                     batch_size=train_args.preprocessing_batch_size,
                     remove_columns=set(sum(datasets.column_names.values(), [])),
                     desc=f"preprocess-{repo_name}",
@@ -242,7 +251,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
     processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    image_token_index, image_seq_length = model.config.image_token_index, model.config.image_seq_length
+    image_token_index = model.config.image_token_index
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 

@@ -90,6 +90,10 @@ class LlavaInsturctionArguments(TrainingArguments):
         self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
         self.data_config_name_map = json.loads(self.data_config_name_map) if self.data_config_name_map else {}
 
+        self.train_dataset_prefix = self.train_dataset_prefix if self.train_dataset_prefix else []
+        self.valid_dataset_prefix = self.valid_dataset_prefix if self.valid_dataset_prefix else []
+        self.test_dataset_prefix = self.test_dataset_prefix if self.test_dataset_prefix else []
+
 
 class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
     def __init__(self, image_processor, **kwargs):
@@ -138,13 +142,11 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                 train_args.length_column_name: [],
             }
 
-        pixel_value_ls = list()
-        input_id_ls = list()
-        length_ls = list()
+        finish_pixel_value_ls, finish_input_id_ls, finish_length_ls = (list(), list(), list())
         for image, conversation in zip(image_ls, conversations_ls):
             idx = 0
             while conversation[idx : idx + 2]:
-                text = processor.apply_chat_template(
+                text = processor.tokenizer.apply_chat_template(
                     conversation[: idx + 2],
                     img_token=processor.image_token,
                     tokenize=False,
@@ -161,24 +163,19 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                     break
                 elif (image is None) and (image_token_index in input_ids):
                     break
-                elif image and ((image_token_index == input_ids).sum() / image_seq_length) != 1:
+                # NOTE: 저거 256은 좀 수정해야함.
+                elif image and ((image_token_index == input_ids).sum() / 256) != 1:
                     break
 
-                pixel_value_ls.append(pixel_values)
-                input_id_ls.append(input_ids)
-                length_ls.append(input_ids.shape[0])
+                finish_pixel_value_ls.append(pixel_values)
+                finish_input_id_ls.append(input_ids)
+                finish_length_ls.append(input_ids.shape[0])
                 idx += 2
 
-        # 2048 - 256, 257은 이미지, 근데 값이 애매하게 나와서 1700으로 함.
-        length_flag = [length <= 1700 for length in length_ls]
-        pixel_value_ls = [pixel_value_ls[idx] for idx, flag in enumerate(length_flag) if flag]
-        input_id_ls = [input_id_ls[idx] for idx, flag in enumerate(length_flag) if flag]
-        length_ls = [length_ls[idx] for idx, flag in enumerate(length_flag) if flag]
-
         return {
-            "pixel_values": pixel_value_ls,
-            "input_ids": input_id_ls,
-            train_args.length_column_name: length_ls,
+            "pixel_values": finish_pixel_value_ls,
+            "input_ids": finish_input_id_ls,
+            train_args.length_column_name: finish_length_ls,
         }
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
@@ -186,10 +183,10 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
 
-            name = train_args.data_config_name_map.get(repo_name)
+            config_name = train_args.data_config_name_map.get(repo_name)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
 
-            datasets = load_dataset(repo_name, name)
+            datasets = load_dataset(repo_name, config_name)
 
             for data_type in truncate_map:
                 truncate_size = truncate_map[data_type]
@@ -201,13 +198,13 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
                 datasets[data_type] = data.select(range(truncate_size))
 
+            cache_file_name = None
             if train_args.cache_file_name:
                 get_cache_path: str = lambda x: os.path.join(  # noqa: E731
                     train_args.cache_dir,
-                    f"{name}-{x}_{train_args.cache_file_name}",
+                    f"""{repo_name.split("/")[-1]}-{x}_{train_args.cache_file_name}""",
                 )
-                name = repo_name.split("/")[-1]
-                train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
+                cache_file_name = {x: get_cache_path(x) for x in datasets}
 
             # DatasetsDict이라서 이런식으로 해줘야 함.
             with train_args.main_process_first(desc="data preprocess"):
@@ -216,12 +213,13 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                     num_proc=train_args.preprocessing_num_workers,
                     load_from_cache_file=True,
                     batched=train_args.preprocessing_batched,
-                    cache_file_names=train_args.cache_file_name,
+                    cache_file_names=cache_file_name,
                     batch_size=train_args.preprocessing_batch_size,
                     remove_columns=set(sum(datasets.column_names.values(), [])),
                     desc=f"preprocess-{repo_name}",
                 )
                 datasets.set_format("pt")
+
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     train_dataset_ls.append(datasets[dataset_key])
@@ -255,7 +253,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
     processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    image_token_index, image_seq_length = model.config.image_token_index, model.config.image_seq_length
+    image_token_index = model.config.image_token_index
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -270,8 +268,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         logger.info("now you use liger kernel!")
         from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
 
-        model_type = model.language_model.config.model_type
-        _apply_liger_kernel(model_type)
+        _apply_liger_kernel(model.language_model.config.model_type)
 
     if train_args.torch_compile:
         model = torch.compile(
