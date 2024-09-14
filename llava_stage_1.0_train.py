@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
@@ -78,6 +79,8 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
+
+    data_max_length: int = field(default=400)
 
     # model
     model_name_or_path: str = field(
@@ -163,8 +166,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 break
             elif (image is None) and (image_token_index in input_ids):
                 break
-            # NOTE: 저거 256은 좀 수정해야함.
             elif image and ((image_token_index == input_ids).sum() / 256) != 1:
+                break
+            elif input_ids.shape[0] > train_args.data_max_length:
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -178,11 +182,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         }
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = (list(), list(), list())
         for repo_name in train_args.dataset_repo_ls:
-            logger.info(f"load-{repo_name}")
-
             start_time = time.time()
+            logger.info(f"load-{repo_name}")
 
             config_name = train_args.data_config_name_map.get(repo_name)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
@@ -220,8 +223,14 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     desc=f"preprocess-{repo_name}",
                 )
                 datasets.set_format("pt")
+                datasets = datasets.sort(train_args.length_column_name, reverse=True)
 
-            logger.info(f"{repo_name}-load time: {time.time() - start_time}")
+            length_ls = datasets["train"].select(range(100))[train_args.length_column_name]
+            logger.info(length_ls)
+
+            logger.info(f"{repo_name}-{train_args.local_rank}-load time: {time.time() - start_time}")
+            if train_args.local_rank >= 0:
+                dist.barrier()
 
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
@@ -277,6 +286,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
     # load dataset & preprocess
     train_dataset, valid_dataset, test_dataset = prepare_datasets()
+
+    if train_args.local_rank >= 0:
+        dist.barrier()
 
     # load collator
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
