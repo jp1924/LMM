@@ -178,8 +178,8 @@ def main(train_args: LlavaInsturctionArguments) -> None:
             train_args.length_column_name: finish_length_ls,
         }
 
-    def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+    def prepare_datasets():
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = (list(), list(), list())
         for repo_name in train_args.dataset_repo_ls:
             logger.info(f"load-{repo_name}")
 
@@ -280,13 +280,15 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
     # load datasets
     train_dataset, valid_dataset, test_dataset = prepare_datasets()
-
-    # load collator
     response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
+    instruction_template = processor.tokenizer.encode("### User:\n", add_special_tokens=False)[1:]
+    
+    # load collator
     collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
         image_processor=processor.image_processor,
         response_template=response_template,
+        instruction_template=instruction_template,
     )
 
     # load trainer
@@ -310,7 +312,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
 def train(trainer: Trainer) -> None:
     train_args: LlavaInsturctionArguments = trainer.args
-    trainer.train(resume_from_checkpoint=train_args.resume_from_checkpsoint)
+    trainer.train(resume_from_checkpoint=train_args.resume_from_checkpoint)
 
     save_dir = os.path.join(train_args.output_dir, "last_model")
     trainer.save_model(save_dir)
