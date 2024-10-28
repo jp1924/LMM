@@ -3,16 +3,17 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
 from transformers import (
     HfArgumentParser,
+    LlavaConfig,
     LlavaForConditionalGeneration,
     LlavaProcessor,
     Trainer,
@@ -21,6 +22,7 @@ from transformers import (
 )
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import get_model_param_count
+from transformers.trainer_utils import is_main_process
 
 
 hf_logging.set_verbosity_info()
@@ -66,13 +68,13 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "A map to truncate part of the data. {'repo_name': {'train': 3000, 'validation': 1500}}."},
     )
-    data_config_name_map: Optional[Union[dict, str]] = field(
+    data_name_map: Optional[Union[dict, str]] = field(
         default=None,
         metadata={"help": "A map to config_name of the data. {'repo_name': 'data_config_name'"},
     )
 
     cache_file_name: Optional[str] = field(
-        default=None,
+        default="preprocessor.arrow",
         metadata={"help": "Path to cached file name"},
     )
     cache_dir: Optional[str] = field(
@@ -80,7 +82,10 @@ class LlavaPretrainingArguments(TrainingArguments):
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
 
-    data_max_length: int = field(default=400)
+    data_max_length: int = field(
+        default=400,
+        metadata={"help": "filtering max length dataset"},
+    )
 
     # model
     model_name_or_path: str = field(
@@ -88,27 +93,43 @@ class LlavaPretrainingArguments(TrainingArguments):
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."},
     )
 
+    response_template: str = field(
+        default=None,
+        metadata={"help": ""},
+    )
+    vision_feature_select_strategy: str = field(
+        default="defualt",
+        metadata={"help": "vision_feature_select_strategy에 사용되는 값, default, full 둘중에 하나만 고르셈."},
+    )
+    attn_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "어떤 attention 연산 방식을 사용할지 결정하는 값, default가 eager임, eager, flash_attention_2, sdpa중 하나 고르셈."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
-        self.data_config_name_map = json.loads(self.data_config_name_map) if self.data_config_name_map else {}
+        self.data_name_map = json.loads(self.data_name_map) if self.data_name_map else {}
+        self.response_template = json.loads(self.response_template) if self.response_template else None
 
         self.train_dataset_prefix = self.train_dataset_prefix if self.train_dataset_prefix else []
         self.valid_dataset_prefix = self.valid_dataset_prefix if self.valid_dataset_prefix else []
         self.test_dataset_prefix = self.test_dataset_prefix if self.test_dataset_prefix else []
 
+        self.cache_dir = Path(self.cache_dir) if self.cache_dir else None
+
 
 def main(train_args: LlavaPretrainingArguments) -> None:
-    def preprocessor(example: Dict[str, Union[List[Any], List[List[Any]]]]) -> Dict[str, List[Any]]:
+    def preprocessor(example):
         try:
             image_ls = example["image"]
             image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
-        except BaseException as e:
-            logger.info(f"image load시 애러 발생: {e}")
+        except BaseException:
             return {
                 "pixel_values": [],
                 "input_ids": [],
-                train_args.length_column_name: [],
             }
 
         final_conver_ls = list()
@@ -155,25 +176,25 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 tokenize=False,
             )
             outputs = processor(
-                images=image,
+                images=image.convert("RGB"),
                 text=chat,
                 return_tensors="np",
             )
 
-            pixel_values, input_ids = outputs["pixel_values"][0] if image else None, outputs["input_ids"][0]
+            pixel_values, input_ids, length = (
+                outputs["pixel_values"][0],
+                outputs["input_ids"][0],
+                outputs["input_ids"][0].shape[0],
+            )
 
-            if image and (image_token_index not in input_ids):
+            if image and (config.image_token_index not in input_ids):
                 break
-            elif (image is None) and (image_token_index in input_ids):
-                break
-            elif image and ((image_token_index == input_ids).sum() / 256) != 1:
-                break
-            elif input_ids.shape[0] > train_args.data_max_length:
+            elif (image is None) and (config.image_token_index in input_ids):
                 break
 
             finish_pixel_value_ls.append(pixel_values)
             finish_input_id_ls.append(input_ids)
-            finish_length_ls.append(input_ids.shape[0])
+            finish_length_ls.append(length)
 
         return {
             "pixel_values": finish_pixel_value_ls,
@@ -181,57 +202,73 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             train_args.length_column_name: finish_length_ls,
         }
 
+    def length_filter(length_ls):
+        return [length for length in length_ls if length <= train_args.data_max_length]
+
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls, valid_dataset_ls, test_dataset_ls = (list(), list(), list())
+        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
         for repo_name in train_args.dataset_repo_ls:
             start_time = time.time()
-            logger.info(f"load-{repo_name}")
 
-            config_name = train_args.data_config_name_map.get(repo_name)
+            if is_main_process(train_args.local_rank):
+                logger.info(f"load-{repo_name}")
+
+            data_name = train_args.data_name_map.get(repo_name, None)
             truncate_map = train_args.data_truncate_map.get(repo_name, {})
 
-            datasets = load_dataset(repo_name, config_name)
+            datasets = load_dataset(repo_name, data_name)
+
+            map_cache_file_name = None
+            filter_cache_file_name = None
+            if train_args.cache_file_name:
+                name = repo_name.split("/")[-1]
+                map_cache_file_name = {
+                    x: train_args.cache_dir.joinpath(f"map_{name}-{x}_{train_args.cache_file_name}").as_posix()
+                    for x in datasets
+                }
+                filter_cache_file_name = {
+                    x: train_args.cache_dir.joinpath(f"filter_{name}-{x}_{train_args.cache_file_name}").as_posix()
+                    for x in datasets
+                }
+
+            # DatasetsDict이라서 이런식으로 해줘야 함.
+            datasets = datasets.map(
+                preprocessor,
+                num_proc=train_args.preprocessing_num_workers,
+                load_from_cache_file=True,
+                batched=train_args.preprocessing_batched,
+                cache_file_names=map_cache_file_name,
+                batch_size=train_args.preprocessing_batch_size,
+                remove_columns=set(sum(datasets.column_names.values(), [])),
+                desc=f"preprocess-{repo_name}",
+            )
+            datasets = datasets.filter(
+                length_filter,
+                num_proc=train_args.preprocessing_num_workers,
+                input_columns=[train_args.length_column_name],
+                cache_file_names=filter_cache_file_name,
+                batched=train_args.preprocessing_batched,
+                batch_size=train_args.preprocessing_batch_size,
+                desc=f"length-filtering-{repo_name}",
+            )
 
             for data_type in truncate_map:
                 truncate_size = truncate_map[data_type]
                 data = datasets[data_type].shuffle()
                 if len(data) <= truncate_size:
-                    msg = f"{repo_name}의 {data_type}크기는 {len(data)}이지만, truncate_size는 {truncate_size} 크기를 조절하셈."
-                    logger.info(msg)
+                    if is_main_process(train_args.local_rank):
+                        logger.info(
+                            f"{repo_name}의 {data_type}크기는 {len(data)}이지만"
+                            f"truncate_size는 {truncate_size} 크기를 조절하셈."
+                        )
                     continue
 
                 datasets[data_type] = data.select(range(truncate_size))
 
-            cache_file_name = None
-            if train_args.cache_file_name:
-                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
-                    train_args.cache_dir,
-                    f"""{repo_name.split("/")[-1]}-{x}_{train_args.cache_file_name}""",
-                )
-                cache_file_name = {x: get_cache_path(x) for x in datasets}
+            if is_main_process(train_args.local_rank):
+                logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
-            # DatasetsDict이라서 이런식으로 해줘야 함.
-            with train_args.main_process_first(desc="data preprocess"):
-                datasets = datasets.map(
-                    preprocessor,
-                    num_proc=train_args.preprocessing_num_workers,
-                    load_from_cache_file=True,
-                    batched=train_args.preprocessing_batched,
-                    cache_file_names=cache_file_name,
-                    batch_size=train_args.preprocessing_batch_size,
-                    remove_columns=set(sum(datasets.column_names.values(), [])),
-                    desc=f"preprocess-{repo_name}",
-                )
-                datasets.set_format("pt")
-                datasets = datasets.sort(train_args.length_column_name, reverse=True)
-
-            length_ls = datasets["train"].select(range(100))[train_args.length_column_name]
-            logger.info(length_ls)
-
-            logger.info(f"{repo_name}-{train_args.local_rank}-load time: {time.time() - start_time}")
-            if train_args.local_rank >= 0:
-                dist.barrier()
-
+            datasets.set_format("pt")
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     train_dataset_ls.append(datasets[dataset_key])
@@ -243,29 +280,43 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         train_dataset = None
         if train_dataset_ls:
             train_dataset = concatenate_datasets(train_dataset_ls)
-            if train_args.local_rank <= 0:
+            if is_main_process(train_args.local_rank):
                 logger.info(f"train_dataset:\n{train_dataset}")
 
         valid_dataset = None
         if valid_dataset_ls:
             valid_dataset = concatenate_datasets(valid_dataset_ls)
-            if train_args.local_rank <= 0:
+            if is_main_process(train_args.local_rank):
                 logger.info(f"valid_dataset:\n{valid_dataset}")
 
         test_dataset = None
         if test_dataset_ls:
             test_dataset = concatenate_datasets(test_dataset_ls)
-            if train_args.local_rank <= 0:
+            if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
         return (train_dataset, valid_dataset, test_dataset)
 
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path
+    config = LlavaConfig.from_pretrained(
+        model_name_or_path,
+        attn_implementation=train_args.attn_implementation,
+        vision_feature_select_strategy=train_args.vision_feature_select_strategy,
+    )
+    config.text_config.use_cache = False
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
     processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
-    image_token_index = model.config.image_token_index
+    if hasattr(processor, "vision_feature_use_cls") and "siglip" in config.vision_config.model_type:
+        logger.info("이거 애러 방지하기 위한 임시 brench 사용하고 있음!!!!!!!!!!!!! 나중에 무조건 제거해!!!\n" * 10)
+        tmp_cache_dir = train_args.cache_dir.joinpath("temp_fix")
+        tmp_cache_dir.mkdir(exist_ok=True)
+        train_args.cache_dir = tmp_cache_dir
+        processor.vision_feature_use_cls = False
+
+    # load dataset & preprocess
+    train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -284,24 +335,32 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             fullgraph=True,
         )
 
-    # load dataset & preprocess
-    train_dataset, valid_dataset, test_dataset = prepare_datasets()
+    # response_temp가 잘못된 경우
+    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=True)
+    response_template = processor.decode(train_args.response_template, skip_special_tokens=True)
 
-    if train_args.local_rank >= 0:
-        dist.barrier()
+    if is_main_process(train_args.local_rank):
+        logger.info(f"formated_instruct: {formated_instruct}")
+        logger.info(f"response_template: {response_template}")
+
+    if response_template not in formated_instruct:
+        raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+    elif len(formated_instruct.split(response_template)) != 2:
+        raise ValueError(
+            "response_template이 뭔가 이상한 듯. stage-1인데 같은 문자가 두게나 들어가 있음. 다시 설정하셈."
+        )
 
     # load collator
-    response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForCompletionOnlyLM(
         tokenizer=processor.tokenizer,
-        response_template=response_template,
+        response_template=train_args.response_template,
     )
 
     # load trainer
     trainer = Trainer(
         model=model,
         args=train_args,
-        tokenizer=processor,
+        processing_class=processor,
         data_collator=collator,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
@@ -335,7 +394,7 @@ if "__main__" in __name__:
     parser = HfArgumentParser([LlavaPretrainingArguments])
     train_args, remain_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
-    if remain_args:
+    if remain_args and is_main_process(train_args.local_rank):
         logger.info(f"remain_args: {remain_args}")
 
     if train_args.seed is not None:
