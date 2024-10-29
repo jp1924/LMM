@@ -1,17 +1,19 @@
 import json
 import os
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
-
-# from models import LlavaNextDocForConditionalGeneration
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
 from transformers import (
+    AutoTokenizer,
     HfArgumentParser,
+    LlavaNextConfig,
     LlavaNextForConditionalGeneration,
     LlavaNextImageProcessor,
     LlavaNextProcessor,
@@ -20,7 +22,7 @@ from transformers import (
     set_seed,
 )
 from transformers import logging as hf_logging
-from transformers.utils import is_liger_kernel_available
+from transformers.trainer_utils import is_main_process
 
 
 hf_logging.set_verbosity_info()
@@ -74,7 +76,10 @@ class LlavaInstructionArguments(TrainingArguments):
         default=None,
         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
     )
-
+    data_max_length: int = field(
+        default=3072,
+        metadata={"help": "filtering max length dataset"},
+    )
     # model
     model_name_or_path: str = field(
         default=None,
@@ -85,9 +90,42 @@ class LlavaInstructionArguments(TrainingArguments):
         metadata={"help": "The initial learning rate for AdamW."},
     )
 
+    response_template: str = field(
+        default=None,
+        metadata={"help": "trl collator에서 사용되는 template 값."},
+    )
+    instruction_template: str = field(
+        default=None,
+        metadata={"help": "trl collator에서 사용되는 template 값."},
+    )
+    image_grid_pinpoints: str = field(
+        default=None,
+        metadata={"help": "llava-next image processor에 사용되는 image_grid 사이즈"},
+    )
+    vision_feature_select_strategy: str = field(
+        default="defualt",
+        metadata={"help": "vision_feature_select_strategy에 사용되는 값, default, full 둘중에 하나만 고르셈."},
+    )
+    attn_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "어떤 attention 연산 방식을 사용할지 결정하는 값, default가 eager임, eager, flash_attention_2, sdpa중 하나 고르셈."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
-        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else None
+        self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
+        self.data_name_map = json.loads(self.data_name_map) if self.data_name_map else {}
+        self.response_template = json.loads(self.response_template) if self.response_template else None
+        self.instruction_template = json.loads(self.instruction_template) if self.instruction_template else None
+        self.image_grid_pinpoints = json.loads(self.image_grid_pinpoints) if self.image_grid_pinpoints else None
+
+        self.train_dataset_prefix = self.train_dataset_prefix if self.train_dataset_prefix else []
+        self.valid_dataset_prefix = self.valid_dataset_prefix if self.valid_dataset_prefix else []
+        self.test_dataset_prefix = self.test_dataset_prefix if self.test_dataset_prefix else []
+
+        self.cache_dir = Path(self.cache_dir) if self.cache_dir else None
 
 
 class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
@@ -95,146 +133,29 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
         super().__init__(**kwargs)
         self.image_processor = image_processor
 
-    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+    def torch_call(self, examples):
         input_ids = [{"input_ids": example["input_ids"]} for example in examples]
         pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"] is not None]
+        image_sizes = [example["image_sizes"] for example in examples if example["image_sizes"] is not None]
         batch = super().torch_call(input_ids)
 
         if pixel_values:
-            batch["pixel_values"] = torch.stack(pixel_values)
+            batch["pixel_values"] = torch.concat(pixel_values, dim=0)
+
+        if image_sizes:
+            batch["image_sizes"] = torch.stack(image_sizes, dim=0)
 
         return batch
 
 
-def main(train_args: LlavaInstructionArguments) -> None:
-    def preprocessor(example: Dict[str, Union[List[Any], List[List[Any]]]]) -> Dict[str, List[Any]]:
-        final_conver_ls = list()
-        if "conversations" in example:
-            conversations_ls = example["conversations"]
-            conversations_ls = conversations_ls if isinstance(conversations_ls, list) else [conversations_ls]
-            for idx, conversations in enumerate(conversations_ls):
-                new_conversations = list()
-                for chat in conversations:
-                    try:
-                        chat["content"] = json.loads(chat["content"])
-                    except BaseException as e:
-                        e
-                    new_conversations.append(chat)
-                conversations_ls[idx] = new_conversations
-            final_conver_ls.extend(conversations_ls)
-
-        try:
-            image_ls = example["image"] if "image" in example else [None] * len(final_conver_ls)
-            image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
-        except BaseException as e:  # noqa: F841
-            # logger.info(f"image load시 애러 발생: {e}")
-            return {
-                "pixel_values": [],
-                "input_ids": [],
-                train_args.length_column_name: [],
-            }
-
-        pixel_value_ls = list()
-        image_size_ls = list()
-        input_id_ls = list()
-        length_ls = list()
-        for image, conversation in zip(image_ls, final_conver_ls):
-            idx = 0
-            while conversation[idx : idx + 2]:
-                outputs = processor(
-                    images=image,
-                    text=processor.apply_chat_template(conversation[: idx + 2], img_token=img_token),
-                    return_tensors="np",
-                )
-                pixel_values, input_ids, image_sizes = (
-                    outputs["pixel_values"][0],
-                    outputs["input_ids"][0],
-                    outputs["image_sizes"][0],
-                )
-
-                pixel_value_ls.append(pixel_values)
-                input_id_ls.append(input_ids)
-                length_ls.append(input_ids.shape[0])
-                image_size_ls.append(image_sizes)
-                idx += 2
-        return {
-            "pixel_values": pixel_value_ls,
-            "input_ids": input_id_ls,
-            "image_sizes": image_size_ls,
-            train_args.length_column_name: length_ls,
-        }
-
-    def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
-        for repo_name in train_args.dataset_repo_ls:
-            logger.info(f"load-{repo_name}")
-            datasets = load_dataset(repo_name)
-
-            if repo_name in train_args.data_truncate_map:
-                for data_type in train_args.data_truncate_map[repo_name]:
-                    truncate_size = train_args.data_truncate_map[repo_name][data_type]
-                    data = datasets[data_type].shuffle()
-                    if len(data) <= truncate_size:
-                        continue
-
-                    datasets[data_type] = data.select(range(truncate_size))
-
-            if train_args.cache_file_name:
-                get_cache_path: str = lambda x: os.path.join(  # noqa: E731
-                    train_args.cache_dir,
-                    f"{name}-{x}_{train_args.cache_file_name}",
-                )
-                name = repo_name.split("/")[-1]
-                train_args.cache_file_name = {x: get_cache_path(x) for x in datasets}
-
-            # DatasetsDict이라서 이런식으로 해줘야 함.
-            with train_args.main_process_first(desc="data preprocess"):
-                datasets = datasets.map(
-                    preprocessor,
-                    num_proc=train_args.preprocessing_num_workers,
-                    load_from_cache_file=True,
-                    batched=train_args.preprocessing_batched,
-                    cache_file_names=train_args.cache_file_name,
-                    batch_size=train_args.preprocessing_batch_size,
-                    remove_columns=set(sum(datasets.column_names.values(), [])),
-                    desc=f"preprocess-{repo_name}",
-                )
-                datasets.set_format("pt")
-            for dataset_key in datasets:
-                if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
-                    train_dataset_ls.append(datasets[dataset_key])
-                if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
-                    valid_dataset_ls.append(datasets[dataset_key])
-                if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
-                    test_dataset_ls.append(datasets[dataset_key])
-
-        train_dataset = None
-        if train_dataset_ls:
-            train_dataset = concatenate_datasets(train_dataset_ls)
-            if train_args.local_rank <= 0:
-                logger.info(f"train_dataset:\n{train_dataset}")
-
-        valid_dataset = None
-        if valid_dataset_ls:
-            valid_dataset = concatenate_datasets(valid_dataset_ls)
-            if train_args.local_rank <= 0:
-                logger.info(f"valid_dataset:\n{valid_dataset}")
-
-        test_dataset = None
-        if test_dataset_ls:
-            test_dataset = concatenate_datasets(test_dataset_ls)
-            if train_args.local_rank <= 0:
-                logger.info(f"test_dataset:\n{test_dataset}")
-
-        return (train_dataset, valid_dataset, test_dataset)
-
-    def create_optimizer():
-        decay_parameters = Trainer.get_decay_parameter_names(model)
+class LLaVANextTrainer(Trainer):
+    def create_optimizer(self):
+        decay_parameters = self.get_decay_parameter_names(self.model)
         optimizer_grouped_parameters = [
             {
                 "params": [
                     p
-                    for n, p in model.multi_modal_projector.named_parameters()
+                    for n, p in self.model.multi_modal_projector.named_parameters()
                     if (n in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": train_args.weight_decay,
@@ -243,7 +164,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
             {
                 "params": [
                     p
-                    for n, p in model.multi_modal_projector.named_parameters()
+                    for n, p in self.model.multi_modal_projector.named_parameters()
                     if (n not in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": 0.0,
@@ -252,7 +173,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
             {
                 "params": [
                     p
-                    for n, p in model.language_model.named_parameters()
+                    for n, p in self.model.language_model.named_parameters()
                     if (n in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": train_args.weight_decay,
@@ -261,7 +182,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
             {
                 "params": [
                     p
-                    for n, p in model.language_model.named_parameters()
+                    for n, p in self.model.language_model.named_parameters()
                     if (n not in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": 0.0,
@@ -269,7 +190,9 @@ def main(train_args: LlavaInstructionArguments) -> None:
             },
             {
                 "params": [
-                    p for n, p in model.vision_tower.named_parameters() if (n in decay_parameters and p.requires_grad)
+                    p
+                    for n, p in self.model.vision_tower.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": train_args.weight_decay,
                 "lr": train_args.vision_learning_rate,
@@ -277,7 +200,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
             {
                 "params": [
                     p
-                    for n, p in model.vision_tower.named_parameters()
+                    for n, p in self.model.vision_tower.named_parameters()
                     if (n not in decay_parameters and p.requires_grad)
                 ],
                 "weight_decay": 0.0,
@@ -285,7 +208,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
             },
         ]
 
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(train_args, model)
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(train_args, self.model)
 
         if "params" in optimizer_kwargs:
             optimizer_grouped_parameters = optimizer_kwargs.pop("params")
@@ -304,31 +227,188 @@ def main(train_args: LlavaInstructionArguments) -> None:
 
         return optimizer
 
+
+def main(train_args: LlavaInstructionArguments) -> None:
+    def preprocessor(example):
+        finish_pixel_value_ls, finish_input_id_ls, finish_length_ls, finish_image_sizes_ls = (
+            list(),
+            list(),
+            list(),
+            list(),
+        )
+        for idx, conversations in enumerate(example["conversations"]):
+            for chat in conversations:
+                try:
+                    content = json.loads(chat["content"])
+                    chat["content"] = chat["content"] if isinstance(content, (int, float)) else content
+                except BaseException:
+                    continue
+
+            try:
+                image = example["image"][idx].convert("RGB") if "image" in example else None
+                text = processor.apply_chat_template(conversations, img_token=processor.image_token, tokenize=False)
+            except BaseException:
+                breakpoint()
+                conversations
+
+            outputs = processor(text=text, images=image, return_tensors="np")
+
+            pixel_values, image_sizes, input_ids, length = (
+                outputs["pixel_values"][0] if image else None,
+                outputs["image_sizes"][0] if image else None,
+                outputs["input_ids"][0],
+                outputs["input_ids"][0].shape[0],
+            )
+
+            if image and (config.image_token_index not in input_ids):
+                break
+            elif (image is None) and (config.image_token_index in input_ids):
+                break
+
+            finish_pixel_value_ls.append(pixel_values)
+            finish_image_sizes_ls.append(image_sizes)
+            finish_input_id_ls.append(input_ids)
+            finish_length_ls.append(length)
+
+        return {
+            "pixel_values": finish_pixel_value_ls,
+            "image_sizes": finish_image_sizes_ls,
+            "input_ids": finish_input_id_ls,
+            train_args.length_column_name: finish_length_ls,
+        }
+
+    def length_filter(length_ls):
+        return [length <= train_args.data_max_length for length in length_ls]
+
+    def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = list(), list(), list()
+        for repo_name in train_args.dataset_repo_ls:
+            start_time = time.time()
+
+            if is_main_process(train_args.local_rank):
+                logger.info(f"load-{repo_name}")
+
+            data_name = train_args.data_name_map.get(repo_name, None)
+            truncate_map = train_args.data_truncate_map.get(repo_name, {})
+
+            datasets = load_dataset(repo_name, data_name)
+
+            map_cache_file_name = None
+            filter_cache_file_name = None
+            if train_args.cache_file_name:
+                name = repo_name.split("/")[-1]
+                map_cache_file_name = {
+                    x: train_args.cache_dir.joinpath(f"map_{name}-{x}_{train_args.cache_file_name}").as_posix()
+                    for x in datasets
+                }
+                filter_cache_file_name = {
+                    x: train_args.cache_dir.joinpath(
+                        f"filter_{train_args.data_max_length}_{name}-{x}_{train_args.cache_file_name}"
+                    ).as_posix()
+                    for x in datasets
+                }
+
+            # DatasetsDict이라서 이런식으로 해줘야 함.
+            datasets = datasets.map(
+                preprocessor,
+                num_proc=train_args.preprocessing_num_workers,
+                load_from_cache_file=True,
+                batched=train_args.preprocessing_batched,
+                cache_file_names=map_cache_file_name,
+                batch_size=train_args.preprocessing_batch_size,
+                remove_columns=set(sum(datasets.column_names.values(), [])),
+                desc=f"preprocess-{repo_name}",
+            )
+            datasets = datasets.filter(
+                length_filter,
+                num_proc=train_args.preprocessing_num_workers,
+                input_columns=[train_args.length_column_name],
+                cache_file_names=filter_cache_file_name,
+                batched=train_args.preprocessing_batched,
+                batch_size=train_args.preprocessing_batch_size,
+                desc=f"length-filtering-{repo_name}",
+            )
+
+            for data_type in truncate_map:
+                truncate_size = truncate_map[data_type]
+                data = datasets[data_type].shuffle()
+                if len(data) <= truncate_size:
+                    if is_main_process(train_args.local_rank):
+                        logger.info(
+                            f"{repo_name}의 {data_type}크기는 {len(data)}이지만"
+                            f"truncate_size는 {truncate_size} 크기를 조절하셈."
+                        )
+                    continue
+
+                datasets[data_type] = data.select(range(truncate_size))
+
+            if is_main_process(train_args.local_rank):
+                logger.info(datasets)
+                logger.info(f"{repo_name}-load time: {time.time() - start_time}")
+
+            for dataset_key in datasets:
+                if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
+                    dataset = datasets[dataset_key]
+                    train_dataset_ls.append(dataset)
+
+                if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
+                    dataset = datasets[dataset_key]
+                    valid_dataset_ls.append(dataset)
+
+                if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
+                    dataset = datasets[dataset_key]
+                    test_dataset_ls.append(dataset)
+
+                if is_main_process(train_args.local_rank):
+                    length_ls = sorted(dataset["length"], reverse=True)[:100]
+                    logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
+
+        train_dataset = None
+        if train_dataset_ls:
+            train_dataset = concatenate_datasets(train_dataset_ls)
+            train_dataset.set_format("pt")
+            if is_main_process(train_args.local_rank):
+                logger.info(f"train_dataset:\n{train_dataset}")
+
+        valid_dataset = None
+        if valid_dataset_ls:
+            valid_dataset = concatenate_datasets(valid_dataset_ls)
+            valid_dataset.set_format("pt")
+            if is_main_process(train_args.local_rank):
+                logger.info(f"valid_dataset:\n{valid_dataset}")
+
+        test_dataset = None
+        if test_dataset_ls:
+            test_dataset = concatenate_datasets(test_dataset_ls)
+            test_dataset.set_format("pt")
+            if is_main_process(train_args.local_rank):
+                logger.info(f"test_dataset:\n{test_dataset}")
+
+        return (train_dataset, valid_dataset, test_dataset)
+
     # load model
     model_name_or_path = train_args.resume_from_checkpoint or train_args.model_name_or_path or ""
-    model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path)
-
-    img_token = "<|image|>"
-    image_processor = LlavaNextImageProcessor.from_pretrained(model_name_or_path)
-    processor = LlavaNextProcessor.from_pretrained(
-        model_name_or_path, image_processor=image_processor, img_token=img_token
+    config = LlavaNextConfig.from_pretrained(
+        model_name_or_path,
+        image_grid_pinpoints=train_args.image_grid_pinpoints,
+        attn_implementation=train_args.attn_implementation,
+        vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
-    image_token_index = processor.tokenizer.convert_ids_to_tokens(img_token)
+    config.text_config.use_cache = False
+    model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path, config=config)
 
-    for name, parameter in model.named_parameters():
-        name = name.split(".")[0]
-        if name not in ["multi_modal_projector", "vision_tower"]:
-            continue
-        parameter.requires_grad = False
+    image_processor = LlavaNextImageProcessor.from_pretrained(
+        model_name_or_path,
+        image_grid_pinpoints=train_args.image_grid_pinpoints,
+        crop_size={"height": config.vision_config.image_size, "width": config.vision_config.image_size},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    processor = LlavaNextProcessor(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        vision_feature_select_strategy=train_args.vision_feature_select_strategy,
+    )
 
-    optimizers = (create_optimizer(), None)
-    if is_liger_kernel_available():
-        logger.info("now you use liger kernel!")
-        from liger_kernel.transformers import apply_liger_kernel_to_llama
-        from liger_kernel.triton import apply_liger_triton_cache_manager
-
-        apply_liger_kernel_to_llama()
-        apply_liger_triton_cache_manager()
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -339,20 +419,34 @@ def main(train_args: LlavaInstructionArguments) -> None:
     # load dataset & preprocess
     train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
+    # response_temp가 잘못된 경우, 주로 1.5 할때 multi turn은 넣지 않으니 이렇게 넣음.
+    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=True)
+    response_template = processor.decode(train_args.response_template, skip_special_tokens=True)
+    instruction_template = processor.decode(train_args.instruction_template, skip_special_tokens=True)
+
+    if is_main_process(train_args.local_rank):
+        logger.info(f"formated_instruct: {formated_instruct}")
+        logger.info(f"response_template: {response_template}")
+        logger.info(f"instruction_template: {instruction_template}")
+
+    if response_template not in formated_instruct:
+        raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+    elif instruction_template not in formated_instruct:
+        raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+
     # load collator
-    response_template = processor.tokenizer.encode("\n\n### Assistant:\n", add_special_tokens=False)[3:]
     collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
         image_processor=processor.image_processor,
-        response_template=response_template,
+        response_template=train_args.response_template,
+        instruction_template=train_args.instruction_template,
     )
 
     # load trainer
-    trainer = Trainer(
+    trainer = LLaVANextTrainer(
         model=model,
         args=train_args,
-        tokenizer=processor,
-        # optimizers=optimizers,
+        processing_class=processor,
         data_collator=collator,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,

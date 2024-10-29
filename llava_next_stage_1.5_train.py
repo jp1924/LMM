@@ -3,7 +3,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -11,6 +11,7 @@ from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
 from transformers import (
+    AutoTokenizer,
     HfArgumentParser,
     LlavaNextConfig,
     LlavaNextForConditionalGeneration,
@@ -22,7 +23,6 @@ from transformers import (
 )
 from transformers import logging as hf_logging
 from transformers.trainer_utils import is_main_process
-from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -132,7 +132,7 @@ class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
         super().__init__(**kwargs)
         self.image_processor = image_processor
 
-    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+    def torch_call(self, examples):
         input_ids = [{"input_ids": example["input_ids"]} for example in examples]
         pixel_values = [example["pixel_values"] for example in examples if example["pixel_values"] is not None]
         image_sizes = [example["image_sizes"] for example in examples if example["image_sizes"] is not None]
@@ -244,11 +244,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 img_token=processor.image_token,
                 tokenize=False,
             )
-            outputs = processor(
-                text=text,
-                images=image.convert("RGB"),
-                return_tensors="np",
-            )
+            outputs = processor(text=text, images=image.convert("RGB"), return_tensors="np")
 
             pixel_values, input_ids, image_sizes, length = (
                 outputs["pixel_values"][0],
@@ -275,10 +271,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         }
 
     def length_filter(length_ls):
-        return [length for length in length_ls if length <= train_args.data_max_length]
+        return [length <= train_args.data_max_length for length in length_ls]
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = list(), list(), list()
         for repo_name in train_args.dataset_repo_ls:
             start_time = time.time()
 
@@ -299,7 +295,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     for x in datasets
                 }
                 filter_cache_file_name = {
-                    x: train_args.cache_dir.joinpath(f"filter_{name}-{x}_{train_args.cache_file_name}").as_posix()
+                    x: train_args.cache_dir.joinpath(
+                        f"filter_{train_args.data_max_length}_{name}-{x}_{train_args.cache_file_name}"
+                    ).as_posix()
                     for x in datasets
                 }
 
@@ -314,6 +312,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+
             datasets = datasets.filter(
                 length_filter,
                 num_proc=train_args.preprocessing_num_workers,
@@ -338,32 +337,44 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 datasets[data_type] = data.select(range(truncate_size))
 
             if is_main_process(train_args.local_rank):
+                logger.info(datasets)
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
-            datasets.set_format("pt")
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
-                    train_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    train_dataset_ls.append(dataset)
+
                 if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
-                    valid_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    valid_dataset_ls.append(dataset)
+
                 if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
-                    test_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    test_dataset_ls.append(dataset)
+
+                if is_main_process(train_args.local_rank):
+                    length_ls = sorted(dataset["length"], reverse=True)[:100]
+                    logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
 
         train_dataset = None
         if train_dataset_ls:
             train_dataset = concatenate_datasets(train_dataset_ls)
+            train_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"train_dataset:\n{train_dataset}")
 
         valid_dataset = None
         if valid_dataset_ls:
             valid_dataset = concatenate_datasets(valid_dataset_ls)
+            valid_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"valid_dataset:\n{valid_dataset}")
 
         test_dataset = None
         if test_dataset_ls:
             test_dataset = concatenate_datasets(test_dataset_ls)
+            test_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
@@ -378,15 +389,16 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
     config.text_config.use_cache = False
-    image_size = config.vision_config.image_size
     model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path, config=config)
+
     image_processor = LlavaNextImageProcessor.from_pretrained(
         model_name_or_path,
         image_grid_pinpoints=train_args.image_grid_pinpoints,
-        crop_size={"height": image_size, "width": image_size},
+        crop_size={"height": config.vision_config.image_size, "width": config.vision_config.image_size},
     )
-    processor = LlavaNextProcessor.from_pretrained(
-        model_name_or_path,
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    processor = LlavaNextProcessor(
+        tokenizer=tokenizer,
         image_processor=image_processor,
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
@@ -397,14 +409,6 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         tmp_cache_dir.mkdir(exist_ok=True)
         train_args.cache_dir = tmp_cache_dir
         processor.vision_feature_use_cls = False
-
-    if is_liger_kernel_available() and train_args.use_liger_kernel:
-        logger.info("now you use liger kernel!")
-        from liger_kernel.transformers import apply_liger_kernel_to_llama
-        from liger_kernel.triton import apply_liger_triton_cache_manager
-
-        apply_liger_kernel_to_llama()
-        apply_liger_triton_cache_manager()
 
     if train_args.torch_compile:
         model = torch.compile(
