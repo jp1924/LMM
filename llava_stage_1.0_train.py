@@ -203,10 +203,10 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         }
 
     def length_filter(length_ls):
-        return [length for length in length_ls if length <= train_args.data_max_length]
+        return [length <= train_args.data_max_length for length in length_ls]
 
     def prepare_datasets() -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        train_dataset_ls = valid_dataset_ls = test_dataset_ls = list()
+        train_dataset_ls, valid_dataset_ls, test_dataset_ls = list(), list(), list()
         for repo_name in train_args.dataset_repo_ls:
             start_time = time.time()
 
@@ -227,7 +227,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                     for x in datasets
                 }
                 filter_cache_file_name = {
-                    x: train_args.cache_dir.joinpath(f"filter_{name}-{x}_{train_args.cache_file_name}").as_posix()
+                    x: train_args.cache_dir.joinpath(
+                        f"filter_{train_args.data_max_length}_{name}-{x}_{train_args.cache_file_name}"
+                    ).as_posix()
                     for x in datasets
                 }
 
@@ -242,6 +244,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+
             datasets = datasets.filter(
                 length_filter,
                 num_proc=train_args.preprocessing_num_workers,
@@ -266,32 +269,44 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 datasets[data_type] = data.select(range(truncate_size))
 
             if is_main_process(train_args.local_rank):
+                logger.info(datasets)
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
-            datasets.set_format("pt")
             for dataset_key in datasets:
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
-                    train_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    train_dataset_ls.append(dataset)
+
                 if dataset_key in train_args.valid_dataset_prefix and train_args.do_eval:
-                    valid_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    valid_dataset_ls.append(dataset)
+
                 if dataset_key in train_args.test_dataset_prefix and train_args.do_predict:
-                    test_dataset_ls.append(datasets[dataset_key])
+                    dataset = datasets[dataset_key]
+                    test_dataset_ls.append(dataset)
+
+                if is_main_process(train_args.local_rank):
+                    length_ls = sorted(dataset["length"], reverse=True)[:100]
+                    logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
 
         train_dataset = None
         if train_dataset_ls:
             train_dataset = concatenate_datasets(train_dataset_ls)
+            train_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"train_dataset:\n{train_dataset}")
 
         valid_dataset = None
         if valid_dataset_ls:
             valid_dataset = concatenate_datasets(valid_dataset_ls)
+            valid_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"valid_dataset:\n{valid_dataset}")
 
         test_dataset = None
         if test_dataset_ls:
             test_dataset = concatenate_datasets(test_dataset_ls)
+            test_dataset.set_format("pt")
             if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
