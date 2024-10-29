@@ -401,6 +401,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     processor = LlavaNextProcessor(
         tokenizer=tokenizer,
         image_processor=image_processor,
+        chat_template=tokenizer.chat_template,
+        image_token=tokenizer.convert_ids_to_tokens(config.image_token_index),
+        patch_size=config.vision_config.patch_size,
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
 
