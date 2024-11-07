@@ -23,6 +23,7 @@ from transformers import (
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import get_model_param_count
 from transformers.trainer_utils import is_main_process
+from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -87,6 +88,15 @@ class LlavaPretrainingArguments(TrainingArguments):
         metadata={"help": "filtering max length dataset"},
     )
 
+    sot_token: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
+    )
+    eot_token: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
+    )
+
     # model
     model_name_or_path: str = field(
         default=None,
@@ -123,63 +133,35 @@ class LlavaPretrainingArguments(TrainingArguments):
 
 def main(train_args: LlavaPretrainingArguments) -> None:
     def preprocessor(example):
-        try:
-            image_ls = example["image"]
-            image_ls = image_ls if isinstance(image_ls, list) else [image_ls]
-        except BaseException:
-            return {
-                "pixel_values": [],
-                "input_ids": [],
-            }
-
-        final_conver_ls = list()
         if "caption" in example:
-            caption_ls = example["caption"]
-            caption_ls = caption_ls if isinstance(caption_ls, list) else [caption_ls]
-            for caption in caption_ls:
+            conversation_ls = list()
+            for caption in example["caption"]:
                 conversation = [
-                    {"role": "user", "content": [{"type": "image"}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": caption}]},
-                ]
-                final_conver_ls.append(conversation)
-        elif "conversations" in example:
-            conversations_ls = example["conversations"]
-            conversations_ls = conversations_ls if isinstance(conversations_ls, list) else [conversations_ls]
-            for idx, conversations in enumerate(conversations_ls):
-                new_conversations = list()
-                for chat in conversations:
-                    chat["content"] = json.loads(chat["content"])
-                    new_conversations.append(chat)
-                conversations_ls[idx] = new_conversations
-            final_conver_ls.extend(conversations_ls)
-        elif "question_answer" in example:
-            question_answer_ls = example["question_answer"]
-            question_answer_ls = question_answer_ls if isinstance(question_answer_ls, list) else [question_answer_ls]
-            for question_answers in question_answer_ls:
-                question_answer = random.choice(question_answers)
-                conversation = [
+                    {"role": "user", "content": json.dumps([{"type": "image"}], ensure_ascii=False)},
                     {
-                        "role": "user",
-                        "content": [{"type": "text", "text": question_answer["question"]}, {"type": "image"}],
+                        "role": "assistant",
+                        "content": json.dumps([{"type": "text", "text": caption}], ensure_ascii=False),
                     },
-                    {"role": "assistant", "content": [{"type": "text", "text": question_answer["answer"]}]},
                 ]
-                final_conver_ls.append(conversation)
-        else:
-            exit("지원하는 않는 데이터 타입, 종료함.")
+                conversation_ls.append(conversation)
 
-        finish_pixel_value_ls, finish_input_id_ls, finish_length_ls = (list(), list(), list())
-        for image, conversation in zip(image_ls, final_conver_ls):
-            chat = processor.tokenizer.apply_chat_template(
-                conversation,
-                img_token=processor.image_token,
+            example["conversations"] = conversation_ls
+
+        finish_pixel_value_ls, finish_input_id_ls, finish_length_ls = list(), list(), list()
+        for image, conversations in zip(example["image"], example["conversations"]):
+            for chat in conversations:
+                content = json.loads(chat["content"])
+                chat["content"] = content
+
+            image = image.convert("RGB")
+            text = processor.apply_chat_template(
+                conversations,
                 tokenize=False,
+                img_token=processor.image_token,
+                sot_token=train_args.sot_token,
+                eot_token=train_args.eot_token,
             )
-            outputs = processor(
-                images=image.convert("RGB"),
-                text=chat,
-                return_tensors="np",
-            )
+            outputs = processor(text=text, images=image, return_tensors="np")
 
             pixel_values, input_ids, length = (
                 outputs["pixel_values"][0],
@@ -188,8 +170,11 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             )
 
             if image and (config.image_token_index not in input_ids):
-                break
-            elif (image is None) and (config.image_token_index in input_ids):
+                logger.info(f"text: {text}")
+                logger.info(f"image: {image}")
+                logger.info(f"input_ids: {input_ids}")
+                logger.info(f"length: {length}")
+                logger.info(f"image and (config.image_token_index not in input_ids) 필터링 됨.")
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -218,6 +203,9 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
             datasets = load_dataset(repo_name, data_name)
 
+            if repo_name == "jp1924/Coyo700m-1":
+                datasets["train"] = datasets["train"].select(range(200000))
+
             map_cache_file_name = None
             filter_cache_file_name = None
             if train_args.cache_file_name:
@@ -244,6 +232,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+            if is_main_process(train_args.local_rank):
+                logger.info(f"{repo_name}-before_filtering: {datasets}")
 
             datasets = datasets.filter(
                 length_filter,
@@ -269,7 +259,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 datasets[data_type] = data.select(range(truncate_size))
 
             if is_main_process(train_args.local_rank):
-                logger.info(datasets)
+                logger.info(f"{repo_name}-after_filtering: {datasets}")
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
             for dataset_key in datasets:
@@ -343,6 +333,12 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
     logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
+    if is_liger_kernel_available() and train_args.use_liger_kernel:
+        logger.info("now you use liger kernel!")
+        from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
+
+        _apply_liger_kernel(model.language_model.config.model_type)
+
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -352,8 +348,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         )
 
     # response_temp가 잘못된 경우
-    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=True)
-    response_template = processor.decode(train_args.response_template, skip_special_tokens=True)
+    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=False)
+    response_template = processor.decode(train_args.response_template, skip_special_tokens=False)
 
     if is_main_process(train_args.local_rank):
         logger.info(f"formated_instruct: {formated_instruct}")

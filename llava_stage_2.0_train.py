@@ -22,6 +22,7 @@ from transformers import (
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import get_model_param_count
 from transformers.trainer_utils import is_main_process
+from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -150,12 +151,14 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                 except BaseException:
                     continue
 
-            try:
-                image = example["image"][idx].convert("RGB") if "image" in example else None
-                text = processor.apply_chat_template(conversations, img_token=processor.image_token, tokenize=False)
-            except BaseException:
-                breakpoint()
-                conversations
+            image = example["image"][idx].convert("RGB") if "image" in example else None
+            text = processor.apply_chat_template(
+                conversations,
+                tokenize=False,
+                img_token=processor.image_token,
+                sot_token=train_args.sot_token,
+                eot_token=train_args.eot_token,
+            )
 
             outputs = processor(text=text, images=image, return_tensors="np")
 
@@ -222,6 +225,10 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+
+            if is_main_process(train_args.local_rank):
+                logger.info(f"{repo_name}-before_filtering: {datasets}")
+
             datasets = datasets.filter(
                 length_filter,
                 num_proc=train_args.preprocessing_num_workers,
@@ -246,11 +253,10 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                 datasets[data_type] = data.select(range(truncate_size))
 
             if is_main_process(train_args.local_rank):
-                logger.info(datasets)
+                logger.info(f"{repo_name}-after_filtering: {datasets}")
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
             for dataset_key in datasets:
-                dataset = None
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     dataset = datasets[dataset_key]
                     train_dataset_ls.append(dataset)
@@ -263,8 +269,8 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                     dataset = datasets[dataset_key]
                     test_dataset_ls.append(dataset)
 
-                if dataset and is_main_process(train_args.local_rank):
-                    length_ls = sorted(dataset[train_args.length_column_name], reverse=True)[:100]
+                if is_main_process(train_args.local_rank):
+                    length_ls = sorted(dataset["length"], reverse=True)[:100]
                     logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
 
         train_dataset = None
@@ -304,6 +310,11 @@ def main(train_args: LlavaInsturctionArguments) -> None:
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
 
+    if train_args.use_liger_kernel and "gemma2" in config.text_config.model_type:
+        from liger_kernel.transformers import _apply_liger_kernel
+
+        _apply_liger_kernel(config.text_config.model_type)
+
     if hasattr(processor, "vision_feature_use_cls") and "siglip" in config.vision_config.model_type:
         logger.info("이거 애러 방지하기 위한 임시 brench 사용하고 있음!!!!!!!!!!!!! 나중에 무조건 제거해!!!\n" * 10)
         tmp_cache_dir = train_args.cache_dir.joinpath("temp_fix")
@@ -320,6 +331,9 @@ def main(train_args: LlavaInsturctionArguments) -> None:
 
     logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
+    if is_liger_kernel_available() and train_args.use_liger_kernel:
+        logger.info("now you use liger kernel!")
+
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -332,9 +346,9 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     # response_temp가 잘못된 경우, 주로 1.5 할때 multi turn은 넣지 않으니 이렇게 넣음.
-    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=True)
-    response_template = processor.decode(train_args.response_template, skip_special_tokens=True)
-    instruction_template = processor.decode(train_args.instruction_template, skip_special_tokens=True)
+    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=False)
+    response_template = processor.decode(train_args.response_template, skip_special_tokens=False)
+    instruction_template = processor.decode(train_args.instruction_template, skip_special_tokens=False)
 
     if is_main_process(train_args.local_rank):
         logger.info(f"formated_instruct: {formated_instruct}")
@@ -346,6 +360,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
     elif instruction_template not in formated_instruct:
         raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
 
+    # [self.tokenizer.convert_ids_to_tokens(x) if x != -100 else x for x in batch.labels[0].tolist()]
     # load collator
     collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
