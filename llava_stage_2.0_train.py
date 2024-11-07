@@ -257,6 +257,7 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
             for dataset_key in datasets:
+                dataset = None
                 if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                     dataset = datasets[dataset_key]
                     train_dataset_ls.append(dataset)
