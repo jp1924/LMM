@@ -269,8 +269,8 @@ def main(train_args: LlavaInsturctionArguments) -> None:
                     dataset = datasets[dataset_key]
                     test_dataset_ls.append(dataset)
 
-                if is_main_process(train_args.local_rank):
-                    length_ls = sorted(dataset["length"], reverse=True)[:100]
+                if dataset and is_main_process(train_args.local_rank):
+                    length_ls = sorted(dataset[train_args.length_column_name], reverse=True)[:100]
                     logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
 
         train_dataset = None
