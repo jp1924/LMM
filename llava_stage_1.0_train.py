@@ -203,11 +203,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
 
             datasets = load_dataset(repo_name, data_name)
 
-            if repo_name == "jp1924/Coyo700m-1":
-                datasets["train"] = datasets["train"].select(range(200000))
-
-            map_cache_file_name = None
-            filter_cache_file_name = None
+            filter_cache_file_name, map_cache_file_name = None, None
             if train_args.cache_file_name:
                 name = repo_name.split("/")[-1]
                 map_cache_file_name = {
@@ -232,6 +228,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+
             if is_main_process(train_args.local_rank):
                 logger.info(f"{repo_name}-before_filtering: {datasets}")
 
