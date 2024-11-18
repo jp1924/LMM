@@ -1,8 +1,10 @@
 import json
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from pprint import pformat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -63,9 +65,21 @@ class LlavaInstructionArguments(TrainingArguments):
         default="eval_other",
         metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
+    data_name_map: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={"help": "A map to config_name of the data. {'repo_name': 'data_config_name'"},
+    )
     data_truncate_map: Optional[Union[dict, str]] = field(
         default=None,
         metadata={"help": "A map to truncate part of the data. {‘repo_name’: {‘train’: 3000, ‘validation’: 1500}}."},
+    )
+    sot_token: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
+    )
+    eot_token: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
     )
 
     cache_file_name: Optional[str] = field(
@@ -244,13 +258,14 @@ def main(train_args: LlavaInstructionArguments) -> None:
                 except BaseException:
                     continue
 
-            try:
-                image = example["image"][idx].convert("RGB") if "image" in example else None
-                text = processor.apply_chat_template(conversations, img_token=processor.image_token, tokenize=False)
-            except BaseException:
-                breakpoint()
-                conversations
-
+            image = example["image"][idx].convert("RGB") if "image" in example else None
+            text = processor.apply_chat_template(
+                conversations,
+                tokenize=False,
+                img_token=processor.image_token,
+                sot_token=train_args.sot_token,
+                eot_token=train_args.eot_token,
+            )
             outputs = processor(text=text, images=image, return_tensors="np")
 
             pixel_values, image_sizes, input_ids, length = (
@@ -261,8 +276,18 @@ def main(train_args: LlavaInstructionArguments) -> None:
             )
 
             if image and (config.image_token_index not in input_ids):
+                logger.info(f"text: {text}")
+                logger.info(f"image: {image}")
+                logger.info(f"input_ids: {input_ids}")
+                logger.info(f"length: {length}")
+                logger.info("image and (config.image_token_index not in input_ids) 필터링 됨.")
                 break
             elif (image is None) and (config.image_token_index in input_ids):
+                logger.info(f"text: {text}")
+                logger.info(f"image: {image}")
+                logger.info(f"input_ids: {input_ids}")
+                logger.info(f"length: {length}")
+                logger.info("(image is None) and (config.image_token_index in input_ids) 필터링 됨.")
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -319,6 +344,13 @@ def main(train_args: LlavaInstructionArguments) -> None:
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
             )
+
+            if is_main_process(train_args.local_rank):
+                for key in datasets:
+                    hist = Counter(datasets[key][train_args.length_column_name])
+                    hist = sorted(hist.items(), reverse=True, key=lambda x: x[0])
+                    logger.info(f"{repo_name}_{key}-before_filtering: {pformat(hist)}")
+
             datasets = datasets.filter(
                 length_filter,
                 num_proc=train_args.preprocessing_num_workers,
@@ -343,7 +375,11 @@ def main(train_args: LlavaInstructionArguments) -> None:
                 datasets[data_type] = data.select(range(truncate_size))
 
             if is_main_process(train_args.local_rank):
-                logger.info(datasets)
+                for key in datasets:
+                    hist = Counter(datasets[key][train_args.length_column_name])
+                    hist = sorted(hist.items(), reverse=True, key=lambda x: x[0])
+                    logger.info(f"{repo_name}_{key}-after_filtering: {pformat(hist)}")
+
                 logger.info(f"{repo_name}-load time: {time.time() - start_time}")
 
             for dataset_key in datasets:
@@ -385,6 +421,28 @@ def main(train_args: LlavaInstructionArguments) -> None:
             if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
+        sample_dataset = train_dataset or valid_dataset or test_dataset
+        if sample_dataset and is_main_process(train_args.local_rank):
+            formated_instruct = processor.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
+            response_template = processor.decode(train_args.response_template or [], skip_special_tokens=False)
+            instruction_template = processor.decode(train_args.instruction_template or [], skip_special_tokens=False)
+
+            if is_main_process(train_args.local_rank):
+                logger.info(f"formated_instruct: {formated_instruct}")
+                logger.info(f"response_template: {response_template}")
+                logger.info(f"instruction_template: {instruction_template}")
+
+            if train_args.do_train and train_args.response_template and response_template not in formated_instruct:
+                raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+            elif (
+                train_args.do_train
+                and train_args.instruction_template
+                and instruction_template not in formated_instruct
+            ):
+                raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+        elif sample_dataset is None:
+            logger.warn("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
+
         return (train_dataset, valid_dataset, test_dataset)
 
     # load model
@@ -396,6 +454,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
     config.text_config.use_cache = False
+
     model = LlavaNextForConditionalGeneration.from_pretrained(model_name_or_path, config=config)
 
     image_processor = LlavaNextImageProcessor.from_pretrained(
@@ -413,6 +472,18 @@ def main(train_args: LlavaInstructionArguments) -> None:
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
 
+    if train_args.use_liger_kernel and "gemma2" in config.text_config.model_type:
+        from liger_kernel.transformers import _apply_liger_kernel
+
+        _apply_liger_kernel(config.text_config.model_type)
+
+    if hasattr(processor, "vision_feature_use_cls") and "siglip" in config.vision_config.model_type:
+        logger.info("이거 애러 방지하기 위한 임시 brench 사용하고 있음!!!!!!!!!!!!! 나중에 무조건 제거해!!!\n" * 10)
+        tmp_cache_dir = train_args.cache_dir.joinpath("temp_fix")
+        tmp_cache_dir.mkdir(exist_ok=True)
+        train_args.cache_dir = tmp_cache_dir
+        processor.vision_feature_use_cls = False
+
     if train_args.torch_compile:
         model = torch.compile(
             model,
@@ -422,21 +493,6 @@ def main(train_args: LlavaInstructionArguments) -> None:
         )
     # load dataset & preprocess
     train_dataset, valid_dataset, test_dataset = prepare_datasets()
-
-    # response_temp가 잘못된 경우, 주로 1.5 할때 multi turn은 넣지 않으니 이렇게 넣음.
-    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=True)
-    response_template = processor.decode(train_args.response_template, skip_special_tokens=True)
-    instruction_template = processor.decode(train_args.instruction_template, skip_special_tokens=True)
-
-    if is_main_process(train_args.local_rank):
-        logger.info(f"formated_instruct: {formated_instruct}")
-        logger.info(f"response_template: {response_template}")
-        logger.info(f"instruction_template: {instruction_template}")
-
-    if response_template not in formated_instruct:
-        raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
-    elif instruction_template not in formated_instruct:
-        raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
 
     # load collator
     collator = DataCollatorForImageCompletion(

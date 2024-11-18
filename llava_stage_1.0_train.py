@@ -107,6 +107,10 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": ""},
     )
+    instruction_template: str = field(
+        default=None,
+        metadata={"help": "trl collator에서 사용되는 template 값."},
+    )
     vision_feature_select_strategy: str = field(
         default="defualt",
         metadata={"help": "vision_feature_select_strategy에 사용되는 값, default, full 둘중에 하나만 고르셈."},
@@ -123,6 +127,7 @@ class LlavaPretrainingArguments(TrainingArguments):
         self.data_truncate_map = json.loads(self.data_truncate_map) if self.data_truncate_map else {}
         self.data_name_map = json.loads(self.data_name_map) if self.data_name_map else {}
         self.response_template = json.loads(self.response_template) if self.response_template else None
+        self.instruction_template = json.loads(self.instruction_template) if self.instruction_template else None
 
         self.train_dataset_prefix = self.train_dataset_prefix if self.train_dataset_prefix else []
         self.valid_dataset_prefix = self.valid_dataset_prefix if self.valid_dataset_prefix else []
@@ -298,6 +303,28 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
+        sample_dataset = train_dataset or valid_dataset or test_dataset
+        if sample_dataset and is_main_process(train_args.local_rank):
+            formated_instruct = processor.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
+            response_template = processor.decode(train_args.response_template or [], skip_special_tokens=False)
+            instruction_template = processor.decode(train_args.instruction_template or [], skip_special_tokens=False)
+
+            if is_main_process(train_args.local_rank):
+                logger.info(f"formated_instruct: {formated_instruct}")
+                logger.info(f"response_template: {response_template}")
+                logger.info(f"instruction_template: {instruction_template}")
+
+            if train_args.do_train and train_args.response_template and response_template not in formated_instruct:
+                raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+            elif (
+                train_args.do_train
+                and train_args.instruction_template
+                and instruction_template not in formated_instruct
+            ):
+                raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+        elif sample_dataset is None:
+            logger.warn("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
+
         return (train_dataset, valid_dataset, test_dataset)
 
     # load model
@@ -317,9 +344,6 @@ def main(train_args: LlavaPretrainingArguments) -> None:
         tmp_cache_dir.mkdir(exist_ok=True)
         train_args.cache_dir = tmp_cache_dir
         processor.vision_feature_use_cls = False
-
-    # load dataset & preprocess
-    train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     logger.info(f"before_alive_param: {get_model_param_count(model, trainable_only=True)}")
 
@@ -344,20 +368,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             fullgraph=True,
         )
 
-    # response_temp가 잘못된 경우
-    formated_instruct = processor.decode(train_dataset[0]["input_ids"], skip_special_tokens=False)
-    response_template = processor.decode(train_args.response_template, skip_special_tokens=False)
-
-    if is_main_process(train_args.local_rank):
-        logger.info(f"formated_instruct: {formated_instruct}")
-        logger.info(f"response_template: {response_template}")
-
-    if response_template not in formated_instruct:
-        raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
-    elif len(formated_instruct.split(response_template)) != 2:
-        raise ValueError(
-            "response_template이 뭔가 이상한 듯. stage-1인데 같은 문자가 두게나 들어가 있음. 다시 설정하셈."
-        )
+    # load dataset & preprocess
+    train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     # load collator
     collator = DataCollatorForCompletionOnlyLM(
