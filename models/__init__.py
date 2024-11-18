@@ -1,2 +1,0 @@
-from .configuration_llava_next_doc import LlavaNextDocConfig
-from .modeling_llava_next_doc import LlavaNextDocForConditionalGeneration
