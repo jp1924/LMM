@@ -16,10 +16,10 @@ RUN ln -s /usr/bin/python3.10 /usr/bin/python
 
 # 파이썬 관련 유틸
 RUN pip install -U pip wheel setuptools && \
-    pip install transformers==4.46.0 && \
-    pip install accelerate==0.34.2 datasets==2.21.0 evaluate==0.4.2 trl==0.9.6 peft==0.12.0 deepspeed==0.15.0 && \
-    pip install bitsandbytes==0.43.3 scipy==1.14.1 sentencepiece==0.2.0 pillow==10.4.0 liger-kernel==0.2.1 && \
+    pip install transformers==4.46.3 && \
+    pip install accelerate==1.1.1 datasets==3.1.0 evaluate==0.4.3 trl==0.12.1 peft==0.13.2 deepspeed==0.15.4 && \
+    pip install bitsandbytes scipy sentencepiece pillow liger-kernel && \
     pip install ruff natsort setproctitle glances[gpu] wandb comet-ml
 
-RUN pip install torch==2.4.0+cu121 torchvision==0.19.0+cu121 --index-url https://download.pytorch.org/whl/cu121 && \
-    pip install flash-attn==2.6.3
+RUN pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install flash-attn==2.7.0.post2
