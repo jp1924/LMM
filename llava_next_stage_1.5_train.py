@@ -85,6 +85,15 @@ class LlavaPretrainingArguments(TrainingArguments):
         metadata={"help": "filtering max length dataset"},
     )
 
+    sot_token: str = field(
+        default=None,
+        metadata={"help": "start of text token"},
+    )
+    eot_token: str = field(
+        default=None,
+        metadata={"help": "end of text token"},
+    )
+
     # model
     model_name_or_path: str = field(
         default=None,

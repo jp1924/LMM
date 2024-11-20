@@ -104,6 +104,15 @@ class LlavaInstructionArguments(TrainingArguments):
         metadata={"help": "The initial learning rate for AdamW."},
     )
 
+    sot_token: str = field(
+        default=None,
+        metadata={"help": "start of text token"},
+    )
+    eot_token: str = field(
+        default=None,
+        metadata={"help": "end of text token"},
+    )
+
     response_template: str = field(
         default=None,
         metadata={"help": "trl collator에서 사용되는 template 값."},
