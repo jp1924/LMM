@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import json
 import os
 import random
@@ -375,11 +376,13 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             fullgraph=True,
         )
 
-    if train_args.do_data_main_process_first:
-        with train_args.main_process_first(desc="main_process_first"):
-            # load datasets
-            train_dataset, valid_dataset, test_dataset = prepare_datasets()
-    else:
+    context = (
+        train_args.main_process_first(desc="main_process_first")
+        if train_args.do_data_main_process_first
+        else nullcontext()
+    )
+    with context:
+        # load datasets
         train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     # load collator
