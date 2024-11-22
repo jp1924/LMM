@@ -71,7 +71,6 @@ class LlavaPretrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "A map to config_name of the data. {'repo_name': 'data_config_name'"},
     )
-
     cache_file_name: Optional[str] = field(
         default=None,
         metadata={"help": "Path to cached file name"},
@@ -92,6 +91,10 @@ class LlavaPretrainingArguments(TrainingArguments):
     eot_token: str = field(
         default=None,
         metadata={"help": "end of text token"},
+    )
+    do_data_main_process_first: bool = field(
+        default=False,
+        metadata={"help": "main process first"},
     )
 
     # model
@@ -299,6 +302,8 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             filter_cache_file_name = None
             if train_args.cache_file_name:
                 name = repo_name.split("/")[-1]
+                name = f"{name}-{data_name}" if data_name else name
+
                 map_cache_file_name = {
                     x: train_args.cache_dir.joinpath(f"map_{name}-{x}_{train_args.cache_file_name}").as_posix()
                     for x in datasets
@@ -408,7 +413,7 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             ):
                 raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
         elif sample_dataset is None:
-            logger.warn("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
+            logger.warning("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
 
         return (train_dataset, valid_dataset, test_dataset)
 
@@ -453,8 +458,12 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             fullgraph=True,
         )
 
-    # load dataset & preprocess
-    train_dataset, valid_dataset, test_dataset = prepare_datasets()
+    if train_args.do_data_main_process_first:
+        with train_args.main_process_first(desc="main_process_first"):
+            # load datasets
+            train_dataset, valid_dataset, test_dataset = prepare_datasets()
+    else:
+        train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     collator = DataCollatorForImageCompletion(
         tokenizer=processor.tokenizer,
