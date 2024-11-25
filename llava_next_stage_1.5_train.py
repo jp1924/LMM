@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
-from accelerate import ProfileKwargs
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
@@ -539,6 +538,8 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
 
 
 def train(trainer: Trainer, args: LlavaNextPretrainingArguments) -> None:
+    from accelerate import ProfileKwargs
+
     profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
     context = trainer.accelerator.profile(profile_kwargs) if args.profiling else nullcontext()
 

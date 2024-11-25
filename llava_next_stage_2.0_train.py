@@ -6,10 +6,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
-from accelerate import ProfileKwargs
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
@@ -573,6 +572,8 @@ def main(train_args: LlavaNextInstructionArguments) -> None:
 
 
 def train(trainer: Trainer, args: LlavaNextInstructionArguments) -> None:
+    from accelerate import ProfileKwargs
+
     profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
     context = trainer.accelerator.profile(profile_kwargs) if args.profiling else nullcontext()
 
@@ -588,7 +589,7 @@ def train(trainer: Trainer, args: LlavaNextInstructionArguments) -> None:
 
 
 @torch.no_grad()
-def valid(trainer: Trainer, valid_datasets: Optional[Union[Dataset, Dict[str, Dataset]]] = None) -> None:
+def valid(trainer: Trainer, valid_datasets: Dataset = None) -> None:
     valid_datasets = valid_datasets if valid_datasets else trainer.eval_dataset
     trainer.evaluate(valid_datasets)
 
