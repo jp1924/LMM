@@ -1,14 +1,15 @@
-from contextlib import nullcontext
 import json
 import os
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pformat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from accelerate import ProfileKwargs
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
@@ -34,7 +35,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 @dataclass
-class LlavaInstructionArguments(TrainingArguments):
+class LlavaNextInstructionArguments(TrainingArguments):
     # data
     dataset_repo_ls: List[str] = field(
         default=None,
@@ -140,6 +141,10 @@ class LlavaInstructionArguments(TrainingArguments):
             "help": "어떤 attention 연산 방식을 사용할지 결정하는 값, default가 eager임, eager, flash_attention_2, sdpa중 하나 고르셈."
         },
     )
+    profiling: bool = field(
+        default=False,
+        metadata={"help": "profiling"},
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -156,7 +161,7 @@ class LlavaInstructionArguments(TrainingArguments):
         self.cache_dir = Path(self.cache_dir) if self.cache_dir else None
 
 
-class DataCollatorForImageCompletion(DataCollatorForCompletionOnlyLM):
+class DataCollatorForImageCompletionWithLM(DataCollatorForCompletionOnlyLM):
     def __init__(self, image_processor, **kwargs):
         super().__init__(**kwargs)
         self.image_processor = image_processor
@@ -256,7 +261,7 @@ class LLaVANextTrainer(Trainer):
         return optimizer
 
 
-def main(train_args: LlavaInstructionArguments) -> None:
+def main(train_args: LlavaNextInstructionArguments) -> None:
     def preprocessor(example):
         finish_pixel_value_ls, finish_input_id_ls, finish_length_ls, finish_image_sizes_ls = (
             list(),
@@ -290,18 +295,22 @@ def main(train_args: LlavaInstructionArguments) -> None:
             )
 
             if image and (config.image_token_index not in input_ids):
-                logger.info(f"text: {text}")
-                logger.info(f"image: {image}")
-                logger.info(f"input_ids: {input_ids}")
-                logger.info(f"length: {length}")
-                logger.info("image and (config.image_token_index not in input_ids) 필터링 됨.")
+                logger.info(
+                    f"text: {text}"
+                    f"image: {image}"
+                    f"input_ids: {input_ids}"
+                    f"length: {length}"
+                    "image and (config.image_token_index not in input_ids) 필터링 됨."
+                )
                 break
             elif (image is None) and (config.image_token_index in input_ids):
-                logger.info(f"text: {text}")
-                logger.info(f"image: {image}")
-                logger.info(f"input_ids: {input_ids}")
-                logger.info(f"length: {length}")
-                logger.info("(image is None) and (config.image_token_index in input_ids) 필터링 됨.")
+                logger.info(
+                    f"text: {text}"
+                    f"image: {image}"
+                    f"input_ids: {input_ids}"
+                    f"length: {length}"
+                    "(image is None) and (config.image_token_index in input_ids) 필터링 됨."
+                )
                 break
 
             finish_pixel_value_ls.append(pixel_values)
@@ -437,25 +446,35 @@ def main(train_args: LlavaInstructionArguments) -> None:
             if is_main_process(train_args.local_rank):
                 logger.info(f"test_dataset:\n{test_dataset}")
 
+        # check response_template, instruction_template
         sample_dataset = train_dataset or valid_dataset or test_dataset
         if sample_dataset and is_main_process(train_args.local_rank):
+            response_template = getattr(train_args, "response_template", None)
+            instruction_template = getattr(train_args, "instruction_template", None)
             formated_instruct = processor.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
-            response_template = processor.decode(train_args.response_template or [], skip_special_tokens=False)
-            instruction_template = processor.decode(train_args.instruction_template or [], skip_special_tokens=False)
+            logger.info(f"formated_instruct: {formated_instruct}")
 
-            if is_main_process(train_args.local_rank):
-                logger.info(f"formated_instruct: {formated_instruct}")
+            if response_template is not None:
+                response_template = processor.decode(response_template, skip_special_tokens=False)
                 logger.info(f"response_template: {response_template}")
-                logger.info(f"instruction_template: {instruction_template}")
+                if response_template not in formated_instruct:
+                    raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+            elif not hasattr(train_args, "response_template"):
+                logger.warning("train_args에 response_template이 없음. 근데 애러는 발생하지 않고 그냥 패스함.")
+            else:
+                raise logger.error("response_template이 없음. 다시 서정하셈.")
 
-            if train_args.do_train and train_args.response_template and response_template not in formated_instruct:
-                raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
-            elif (
-                train_args.do_train
-                and train_args.instruction_template
-                and instruction_template not in formated_instruct
-            ):
-                raise ValueError("이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+            if instruction_template is not None:
+                instruction_template = processor.decode(instruction_template, skip_special_tokens=False)
+                logger.info(f"instruction_template: {instruction_template}")
+                if instruction_template not in formated_instruct:
+                    raise ValueError(
+                        "이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈"
+                    )
+            elif not hasattr(train_args, "instruction_template"):
+                logger.warning("train_args에 response_template이 없음. 근데 애러는 발생하지 않고 그냥 패스함.")
+            else:
+                logger.warning("instruction_template이 없음. 근데 애러는 발생하지 않고 그냥 패스함.")
         elif sample_dataset is None:
             logger.warning("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
 
@@ -518,12 +537,20 @@ def main(train_args: LlavaInstructionArguments) -> None:
         train_dataset, valid_dataset, test_dataset = prepare_datasets()
 
     # load collator
-    collator = DataCollatorForImageCompletion(
+    collator = DataCollatorForImageCompletionWithLM(
         tokenizer=processor.tokenizer,
         image_processor=processor.image_processor,
         response_template=train_args.response_template,
         instruction_template=train_args.instruction_template,
     )
+
+    # collator output check
+    if is_main_process(train_args.local_rank):
+        sample_check = collator.torch_call([train_dataset[0]])
+        sample_check["labels"] = sample_check["labels"][sample_check["labels"] != -100].tolist()
+        check_labels = [processor.tokenizer.convert_ids_to_tokens(token) for token in sample_check["labels"]]
+        check_labels = ", ".join(check_labels)
+        logger.info(rf"collator_label: [-100,  ..., -100, {check_labels}]")
 
     # load trainer
     trainer = LLaVANextTrainer(
@@ -536,7 +563,7 @@ def main(train_args: LlavaInstructionArguments) -> None:
     )
 
     if train_args.do_train and train_dataset:
-        train(trainer)
+        train(trainer, train_args)
 
     if train_args.do_eval and valid_dataset:
         valid(trainer)
@@ -545,12 +572,19 @@ def main(train_args: LlavaInstructionArguments) -> None:
         logger.info("do_predict 코드는 아직 작성 중")
 
 
-def train(trainer: Trainer) -> None:
-    train_args: LlavaInstructionArguments = trainer.args
-    trainer.train(resume_from_checkpoint=train_args.resume_from_checkpoint)
+def train(trainer: Trainer, args: LlavaNextInstructionArguments) -> None:
+    profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
+    context = trainer.accelerator.profile(profile_kwargs) if args.profiling else nullcontext()
 
-    save_dir = os.path.join(train_args.output_dir, "last_model")
-    trainer.save_model(save_dir)
+    with context as prof:
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
+    save_path = Path(args.output_dir)
+    if prof:
+        prof.export_memory_timeline(save_path.with_suffix(".memory_trace.json").as_posix())
+        prof.export_chrome_trace(save_path.with_suffix(".chrome_trace.json").as_posix())
+        print(prof.key_averages().table(sort_by="flops", row_limit=10))
+        print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
 
 
 @torch.no_grad()
@@ -560,7 +594,7 @@ def valid(trainer: Trainer, valid_datasets: Optional[Union[Dataset, Dict[str, Da
 
 
 if "__main__" in __name__:
-    parser = HfArgumentParser([LlavaInstructionArguments])
+    parser = HfArgumentParser([LlavaNextInstructionArguments])
     train_args, remain_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     if remain_args:
