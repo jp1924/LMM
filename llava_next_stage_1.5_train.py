@@ -24,6 +24,7 @@ from transformers import (
 )
 from transformers import logging as hf_logging
 from transformers.trainer_utils import is_main_process
+from transformers.utils import is_liger_kernel_available
 
 
 hf_logging.set_verbosity_info()
@@ -477,6 +478,12 @@ def main(train_args: LlavaNextPretrainingArguments) -> None:
         patch_size=config.vision_config.patch_size,
         vision_feature_select_strategy=train_args.vision_feature_select_strategy,
     )
+
+    if is_liger_kernel_available() and train_args.use_liger_kernel:
+        from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
+
+        text_model_type = model.language_model.config.model_type
+        _apply_liger_kernel(text_model_type)
 
     if hasattr(processor, "vision_feature_use_cls") and "siglip" in config.vision_config.model_type:
         logger.info("이거 애러 방지하기 위한 임시 brench 사용하고 있음!!!!!!!!!!!!! 나중에 무조건 제거해!!!\n" * 10)

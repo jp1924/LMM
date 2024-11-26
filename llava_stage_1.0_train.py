@@ -369,6 +369,12 @@ def main(train_args: LlavaPretrainingArguments) -> None:
     model = LlavaForConditionalGeneration.from_pretrained(model_name_or_path)
     processor = LlavaProcessor.from_pretrained(model_name_or_path)
 
+    if is_liger_kernel_available() and train_args.use_liger_kernel:
+        from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
+
+        text_model_type = model.language_model.config.model_type
+        _apply_liger_kernel(text_model_type)
+
     if hasattr(processor, "vision_feature_use_cls") and "siglip" in config.vision_config.model_type:
         logger.info("이거 애러 방지하기 위한 임시 brench 사용하고 있음!!!!!!!!!!!!! 나중에 무조건 제거해!!!\n" * 10)
         tmp_cache_dir = train_args.cache_dir.joinpath("temp_fix")
@@ -384,12 +390,6 @@ def main(train_args: LlavaPretrainingArguments) -> None:
             parameter.requires_grad = False
 
     logger.info(f"after_alive_param: {get_model_param_count(model, trainable_only=True)}")
-
-    if is_liger_kernel_available() and train_args.use_liger_kernel:
-        logger.info("now you use liger kernel!")
-        from liger_kernel.transformers.trainer_integration import _apply_liger_kernel
-
-        _apply_liger_kernel(model.language_model.config.model_type)
 
     if train_args.torch_compile:
         model = torch.compile(
