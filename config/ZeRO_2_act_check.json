@@ -3,21 +3,13 @@
         "enabled": "auto"
     },
     "zero_optimization": {
-        "stage": 3,
+        "stage": 2,
         "allgather_partitions": true,
-        "stage3_prefetch_bucket_size": 0,
-        "stage3_max_live_parameters": 0,
-        "stage3_max_reuse_distance": 0,
         "allgather_bucket_size": 5e7,
         "overlap_comm": false,
         "reduce_scatter": true,
         "reduce_bucket_size": 5e7,
-        "contiguous_gradients": true,
-        "stage3_gather_16bit_weights_on_model_save": true,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": true
-        }
+        "contiguous_gradients": true
     },
     "gradient_accumulation_steps": "auto",
     "gradient_clipping": "auto",
@@ -32,5 +24,13 @@
         "number_checkpoints": 10,
         "synchronize_checkpoint_boundary": false,
         "profile": false
+    },
+    "flops_profiler": {
+        "enabled": true,
+        "profile_step": 1,
+        "module_depth": -1,
+        "top_modules": 1,
+        "detailed": true,
+        "output_file": null
     }
 }
