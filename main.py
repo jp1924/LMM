@@ -28,6 +28,7 @@ from transformers import (
     PreTrainedTokenizer,
     Trainer,
     TrainingArguments,
+    LlavaForConditionalGeneration
 )
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import LengthGroupedSampler, get_model_param_count
@@ -38,8 +39,13 @@ from transformers.utils import is_datasets_available, is_sagemaker_mp_enabled
 @dataclass
 class DataPipelineArguments:
     # data
-    dataset_repo_ls: List[str] = field(metadata={"help": "The name of the dataset to use (via the datasets library)."})
-    preprocessor_type: str = field(metadata={"help": "preprocessor type"})
+    dataset_repo_ls: List[str] = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    data_preprocessor_type: str = field(
+        default=None,
+        metadata={"help": "preprocessor type"},
+    )
 
     preprocessing_num_workers: int = field(
         default=4,
@@ -653,6 +659,7 @@ def main(train_args: VisionSFTArguments) -> None:
                 batch_size=train_args.preprocessing_batch_size,
                 remove_columns=set(sum(datasets.column_names.values(), [])),
                 desc=f"preprocess-{repo_name}",
+                fn_kwargs={"processor": processor, "args": train_args},
             )
 
             for dataset_key in datasets:
@@ -780,13 +787,7 @@ def main(train_args: VisionSFTArguments) -> None:
             fullgraph=True,
         )
 
-    context = (
-        train_args.main_process_first(desc="main_process_first")
-        if train_args.do_data_main_process_first
-        else nullcontext()
-    )
-
-    match train_args.preprocessor_type:
+    match train_args.data_preprocessor_type:
         case "llava_stage-1.0":
             preprocessor_func = llava_stage1_preprocessor
         case "llava_stage-2.0":
@@ -795,6 +796,13 @@ def main(train_args: VisionSFTArguments) -> None:
             preprocessor_func = llava_next_stage1_5_preprocessor
         case "llava_next_stage-2.0":
             preprocessor_func = llava_next_stage2_preprocessor
+
+    context = (
+        train_args.main_process_first(desc="main_process_first")
+        if train_args.do_data_main_process_first
+        else nullcontext()
+    )
+
     with context:
         # load datasets
         train_dataset, valid_dataset, test_dataset = processing_datasets(preprocessor_func)
