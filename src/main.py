@@ -302,7 +302,7 @@ def main(train_args: ImageTextToTextArguments) -> None:
                 logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
                 logger.info(f"{repo_name}/{dataset_key}-size: {original_size} -> {len(dataset)}")
 
-        def concatenate_and_log(datasets_ls: List[Dataset], dataset_type: str) -> Optional[Dataset]:
+        def concat(datasets_ls: List[Dataset], dataset_type: str) -> Optional[Dataset]:
             if datasets_ls:
                 dataset = concatenate_datasets(datasets_ls)
                 dataset.set_format("pt")
@@ -351,11 +351,9 @@ def main(train_args: ImageTextToTextArguments) -> None:
             for dataset_key in datasets:
                 process_dataset(datasets[dataset_key], dataset_key, repo_name, truncate_map, filter_cache_file_name)
 
-        train_dataset, valid_dataset, test_dataset = (
-            concatenate_and_log(train_dataset_ls, "train"),
-            concatenate_and_log(valid_dataset_ls, "valid"),
-            concatenate_and_log(test_dataset_ls, "test"),
-        )
+        train_dataset = concat(train_dataset_ls, "train")
+        valid_dataset = concat(valid_dataset_ls, "valid")
+        test_dataset = concat(test_dataset_ls, "test")
 
         sample_dataset = train_dataset or valid_dataset or test_dataset
         if sample_dataset and train_args.is_world_process_zero:
