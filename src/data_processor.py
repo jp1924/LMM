@@ -32,7 +32,9 @@ def llava_stage1_preprocessor(example, processor: ProcessorMixin, args: Training
                     if part["type"] != "text":
                         continue
 
-                    part["text"] = str(part["text"]) if isinstance(part["text"], (int, float)) else part["text"]
+                    part["text"] = (
+                        str(part["text"]) if isinstance(part["text"], (int, float)) else part["text"].strip()
+                    )
 
             content = str(content) if isinstance(content, (int, float)) else content
             chat["content"] = content

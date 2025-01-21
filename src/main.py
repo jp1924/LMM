@@ -20,6 +20,7 @@ from setproctitle import setproctitle
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
+from trainer import PackingImageCollator, PackingTrainer
 from transformers import (
     AutoConfig,
     AutoModelForImageTextToText,
@@ -28,7 +29,6 @@ from transformers import (
     PreTrainedTokenizer,
     Trainer,
     TrainingArguments,
-    LlavaForConditionalGeneration
 )
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import LengthGroupedSampler, get_model_param_count
@@ -40,13 +40,17 @@ from transformers.utils import is_datasets_available, is_sagemaker_mp_enabled
 class DataPipelineArguments:
     # data
     dataset_repo_ls: List[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+        default_factory=list,
+        metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
     data_preprocessor_type: str = field(
         default=None,
         metadata={"help": "preprocessor type"},
     )
-
+    do_data_main_process_first: bool = field(
+        default=False,
+        metadata={"help": "main process first"},
+    )
     preprocessing_num_workers: int = field(
         default=4,
         metadata={"help": "The number of processes to use for the preprocessing."},
@@ -61,15 +65,15 @@ class DataPipelineArguments:
     )
 
     train_dataset_prefix: List[str] = field(
-        default="train",
+        default_factory=list,
         metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     valid_dataset_prefix: List[str] = field(
-        default="validation",
+        default_factory=list,
         metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
     test_dataset_prefix: List[str] = field(
-        default="eval_other",
+        default_factory=list,
         metadata={"help": "A prefix required to distinguish splits in the data loaded by load_dataset."},
     )
 
@@ -89,10 +93,6 @@ class DataPipelineArguments:
     data_max_length: int = field(
         default=2048,
         metadata={"help": "filtering max length dataset"},
-    )
-    do_data_main_process_first: bool = field(
-        default=False,
-        metadata={"help": "main process first"},
     )
 
 
@@ -127,18 +127,6 @@ class TrainPipelineArguments:
         default=True,
         metadata={"help": "packing shuffle"},
     )
-    config_kwargs: Dict = field(
-        default="{}",
-        metadata={"help": ""},
-    )
-    model_kwargs: str = field(
-        default="{}",
-        metadata={"help": ""},
-    )
-    processor_kwargs: str = field(
-        default="{}",
-        metadata={"help": ""},
-    )
     freeze_named_param: List[str] = field(
         default=None,
         metadata={"help": "freeze_named_param"},
@@ -147,11 +135,31 @@ class TrainPipelineArguments:
         default=False,
         metadata={"help": "profiling"},
     )
+    config_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
+    model_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
+    processor_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
 
 
 @dataclass
-class VisionSFTArguments(TrainingArguments, DataPipelineArguments, TrainPipelineArguments):
+class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPipelineArguments):
+    output_dir: str = field(
+        default=None,
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+    )
+
     def __post_init__(self):
+        if self.output_dir is None:
+            raise ValueError("output_dir은 무조건 설정되어 있어야 한다.")
+
         super().__post_init__()
 
         def _convert_str_dict(passed_value: dict):
@@ -257,13 +265,7 @@ class PackingImageCollator(DataCollatorForCompletionOnlyLM):
         return attention_mask
 
     def _process_features(self, features_ls: List[Union[List[int], Any, Dict[str, Any]]]):
-        input_ids_ls, labels_ls, position_ids_ls, input_length_ls, pixel_values_ls = (
-            list(),
-            list(),
-            list(),
-            list(),
-            list(),
-        )
+        input_ids_ls, labels_ls, position_ids_ls, input_length_ls, pixel_values_ls = [], [], [], [], []
         for features in features_ls:
             batch = super().torch_call([{"input_ids": features["input_ids"]}])
             input_ids, labels = batch.input_ids[0], batch.labels[0]
@@ -284,13 +286,7 @@ class PackingImageCollator(DataCollatorForCompletionOnlyLM):
             batch = self._process_features(features_ls)
             input_ids_ls, labels_ls, position_ids_ls, input_length_ls, pixel_values_ls = batch
         elif isinstance(features_ls[0], list):
-            input_ids_ls, labels_ls, position_ids_ls, input_length_ls, pixel_values_ls = (
-                list(),
-                list(),
-                list(),
-                list(),
-                list(),
-            )
+            input_ids_ls, labels_ls, position_ids_ls, input_length_ls, pixel_values_ls = [], [], [], [], []
             for packing_ls in features_ls:
                 ids, labels, positions, lengths, pixel_values = self._process_features(packing_ls)
 
@@ -523,8 +519,6 @@ class PackingTrainer(Trainer):
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
 
-        self.args: VisionSFTArguments
-
         if self.args.group_by_length and self.args.do_packing:
             raise ValueError("group_by_length and do_packing cannot be used together.")
 
@@ -573,7 +567,7 @@ hf_logging.set_verbosity_info()
 logger = hf_logging.get_logger("transformers")
 
 
-def main(train_args: VisionSFTArguments) -> None:
+def main(train_args: ImageTextToTextArguments) -> None:
     def processing_datasets(func: Callable) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
         def process_dataset(
             dataset: Dataset,
@@ -756,7 +750,7 @@ def main(train_args: VisionSFTArguments) -> None:
         "eos_token_id": processor.tokenizer.eos_token_id,
         "pad_token_id": processor.tokenizer.pad_token_id,
     }
-    config = AutoConfig.from_pretrained(train_args.model_name_or_path, config_kwargs)
+    config = AutoConfig.from_pretrained(train_args.model_name_or_path, **config_kwargs)
     model_kwargs = {"config": config, **train_args.model_kwargs}
     model = AutoModelForImageTextToText.from_pretrained(train_args.model_name_or_path, **model_kwargs)
 
@@ -849,7 +843,7 @@ def main(train_args: VisionSFTArguments) -> None:
         logger.info("do_predict 코드는 아직 작성 중")
 
 
-def train(trainer: Trainer, args: VisionSFTArguments) -> None:
+def train(trainer: PackingTrainer, args: ImageTextToTextArguments) -> None:
     from accelerate import ProfileKwargs
 
     profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
@@ -867,13 +861,13 @@ def train(trainer: Trainer, args: VisionSFTArguments) -> None:
 
 
 @torch.no_grad()
-def valid(trainer: Trainer, valid_datasets: Dataset) -> None:
+def valid(trainer: PackingTrainer, valid_datasets: Dataset) -> None:
     valid_datasets = valid_datasets if valid_datasets else trainer.eval_dataset
     trainer.evaluate(valid_datasets)
 
 
 if "__main__" in __name__:
-    parser = HfArgumentParser([VisionSFTArguments])
+    parser = HfArgumentParser([ImageTextToTextArguments])
     train_args, remain_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     if remain_args and train_args.is_world_process_zero:
