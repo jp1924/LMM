@@ -32,4 +32,11 @@
     "ruff.enable": true,
     "markdownlint.run": "onSave",
     "testing.coverageToolbarEnabled": true,
+    "[json]": {
+        "editor.defaultFormatter": "vscode.json-language-features"
+    },
+    "python.REPL.enableREPLSmartSend": false,
+    "[jsonc]": {
+        "editor.defaultFormatter": "vscode.json-language-features"
+    },
 }
