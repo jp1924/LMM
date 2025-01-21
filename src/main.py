@@ -3,7 +3,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 from data_processor import (
@@ -37,9 +37,16 @@ class DataPipelineArguments:
         default_factory=list,
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
-    data_preprocessor_type: str = field(
-        default=None,
-        metadata={"help": "preprocessor type"},
+    data_preprocessor_type: Literal[
+        "llava_stage-1.0",
+        "llava_stage-2.0",
+        "llava_next_stage-1.5",
+        "llava_next_stage-2.0",
+    ] = field(
+        default_factory=str,
+        metadata={
+            "help": "preprocessor type, [llava_stage-1.0, llava_stage-2.0, llava_next_stage-1.5, llava_next_stage-2.0]"
+        },
     )
     do_data_main_process_first: bool = field(
         default=False,
@@ -129,6 +136,10 @@ class TrainPipelineArguments:
         default=False,
         metadata={"help": "profiling"},
     )
+    profiling_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": "profiling_kwargs"},
+    )
     config_kwargs: Optional[Union[dict, str]] = field(
         default="{}",
         metadata={"help": ""},
@@ -179,6 +190,7 @@ class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPi
             "config_kwargs",
             "model_kwargs",
             "processor_kwargs",
+            "profiling_kwargs",
         ]
         _VALID_LIST_FIELDS = [
             "instruction_template",
@@ -366,9 +378,8 @@ def main(train_args: ImageTextToTextArguments) -> None:
         elif sample_dataset is None:
             logger.warning("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
 
-        end_time = time.time()
         if train_args.is_world_process_zero:
-            logger.info(f"load_dataset_time: {end_time - start_time:.2f}")
+            logger.info(f"load_dataset_time: {time.time() - start_time:.2f}")
 
         return train_dataset, valid_dataset, test_dataset
 
@@ -522,8 +533,8 @@ def main(train_args: ImageTextToTextArguments) -> None:
 def train(trainer: PackingTrainer, args: ImageTextToTextArguments) -> None:
     from accelerate import ProfileKwargs
 
-    profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
-    context = trainer.accelerator.profile(profile_kwargs) if args.profiling else nullcontext()
+    # profile_kwargs = ProfileKwargs(activities=["cpu", "cuda"], profile_memory=True, with_flops=True)
+    context = trainer.accelerator.profile(ProfileKwargs(**args.profiling_kwargs)) if args.profiling else nullcontext()
 
     with context as prof:
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
