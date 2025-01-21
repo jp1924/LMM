@@ -336,5 +336,86 @@ class PackingTrainer(Trainer):
         else:
             return RandomSampler(self.train_dataset)
 
+    def create_optimizer(self):
+        if self.model.config.model_type != "llava_onevision":
+            return super().create_optimizer()
+        decay_parameters = self.get_decay_parameter_names(self.model)
+
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in self.model.multi_modal_projector.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": self.args.weight_decay,
+                "lr": self.args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.multi_modal_projector.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": self.args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.language_model.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": self.args.weight_decay,
+                "lr": self.args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.language_model.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": self.args.learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.vision_tower.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": self.args.weight_decay,
+                "lr": self.args.vision_learning_rate,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.model.vision_tower.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
+                "lr": self.args.vision_learning_rate,
+            },
+        ]
+
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, self.model)
+
+        if "params" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("params")
+
+        # Overwrite `model` in case it's created by `get_optimizer_cls_and_kwargs`
+        # e.g. for LOMO optimizer.
+        if "model" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("model")
+
+        # For layer-wise dummy optimizers we overwrite optimizer_grouped_parameters with `optimizer_dict`
+        # to avoid arguments conflicts.
+        if "optimizer_dict" in optimizer_kwargs:
+            optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+        optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return optimizer
+
 
 __all__ = ["PackingImageCollator", "PackingSampler", "PackingTrainer"]

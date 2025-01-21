@@ -116,6 +116,10 @@ class TrainPipelineArguments:
             "help": "어떤 attention 연산 방식을 사용할지 결정하는 값, default가 eager임, eager, flash_attention_2, sdpa중 하나 고르셈."
         },
     )
+    vision_learning_rate: float = field(
+        default=2e-6,
+        metadata={"help": "오직 llava one vision 모델에서만 사용할 수 있다."},
+    )
     packing_max_elem: int = field(
         default=10,
         metadata={"help": ""},
@@ -431,13 +435,8 @@ def main(train_args: ImageTextToTextArguments) -> None:
 
     # load model
     processor = AutoProcessor.from_pretrained(train_args.model_name_or_path, **train_args.processor_kwargs)
-    config_kwargs = {
-        **train_args.config_kwargs,
-        "bos_token_id": processor.tokenizer.bos_token_id,
-        "eos_token_id": processor.tokenizer.eos_token_id,
-        "pad_token_id": processor.tokenizer.pad_token_id,
-    }
-    config = AutoConfig.from_pretrained(train_args.model_name_or_path, **config_kwargs)
+    config = AutoConfig.from_pretrained(train_args.model_name_or_path, **train_args.config_kwargs)
+
     model_kwargs = {"config": config, **train_args.model_kwargs}
     model = AutoModelForImageTextToText.from_pretrained(train_args.model_name_or_path, **model_kwargs)
 
@@ -504,10 +503,10 @@ def main(train_args: ImageTextToTextArguments) -> None:
         check_labels = ", ".join(check_labels)
         logger.info(f"collator_label: [-100,  ..., -100, {check_labels}]")
 
-    if config.bos_token_ids not in sample_check["input_ids"][0].tolist():
+    if processor.tokenizer.bos_token_id not in sample_check.input_ids[0].tolist():
         raise ValueError("BOS token이 없다. 이거 다시 전처리 해라.")
 
-    if config.eos_token_ids not in sample_check["input_ids"][0].tolist():
+    if processor.tokenizer.eos_token_id not in sample_check.input_ids[0].tolist():
         raise ValueError("EOS token이 없다. 이거 다시 전처리 해라.")
 
     # load trainer
