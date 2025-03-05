@@ -221,3 +221,11 @@ def llava_next_stage2_preprocessor(example, processor: ProcessorMixin, args: Tra
             return_dict.setdefault(key, []).append(value)
 
     return return_dict
+
+
+PROCESSOR_REGISTRY = {
+    "llava_stage-1.0": llava_stage1_preprocessor,
+    "llava_stage-2.0": llava_stage2_preprocessor,
+    "llava_next_stage-1.5": llava_next_stage1_5_preprocessor,
+    "llava_next_stage-2.0": llava_next_stage2_preprocessor,
+}
