@@ -19,7 +19,7 @@ hf_logging.set_verbosity_info()
 logger = hf_logging.get_logger("transformers")
 
 
-class PackingImageCollator(DataCollatorForCompletionOnlyLM):
+class PackingImageCollatorForCompletionOnlyLM(DataCollatorForCompletionOnlyLM):
     def __init__(
         self,
         args: TrainingArguments,
@@ -30,9 +30,8 @@ class PackingImageCollator(DataCollatorForCompletionOnlyLM):
         super().__init__(**kwargs)
         self.dtype = dtype
         self.args = args
-        self.clm = clm
 
-        if not self.clm and (sample_dataset and args.is_world_process_zero):
+        if sample_dataset and args.is_world_process_zero:
             formated_instruct = self.tokenizer.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
             logger.info(f"formated_instruct: {formated_instruct}")
             logger.info(
@@ -467,4 +466,4 @@ class PackingTrainer(Trainer):
         return optimizer
 
 
-__all__ = ["PackingImageCollator", "PackingSampler", "PackingTrainer"]
+__all__ = ["PackingImageCollatorForCompletionOnlyLM", "PackingSampler", "PackingTrainer"]
