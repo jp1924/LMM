@@ -16,7 +16,7 @@ RUN ln -s /usr/bin/python3.10 /usr/bin/python
 
 # 파이썬 관련 유틸
 RUN pip install -U pip wheel setuptools && \
-    pip install git+https://github.com/huggingface/transformers.git@919220dab1e29f4d04eacd61a197a45a4fec2613 && \
+    pip install git+https://github.com/huggingface/transformers.git@66f29aaaf55c8fe0c3dbcd24beede2ca4effac56 && \
     pip install accelerate datasets evaluate trl peft deepspeed liger-kernel && \
     pip install bitsandbytes scipy sentencepiece pillow && \
     pip install ruff natsort setproctitle glances[gpu] wandb cmake
