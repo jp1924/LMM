@@ -3,16 +3,11 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-from data_processor import (
-    llava_next_stage1_5_preprocessor,
-    llava_next_stage2_preprocessor,
-    llava_stage1_preprocessor,
-    llava_stage2_preprocessor,
-)
 from datasets import Dataset, concatenate_datasets, load_dataset
+from preprocessor import PROCESSOR_REGISTRY
 from setproctitle import setproctitle
 from trainer import PackingImageCollator, PackingTrainer
 
@@ -37,12 +32,7 @@ class DataPipelineArguments:
         default_factory=list,
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
-    data_preprocessor_type: Literal[
-        "llava_stage-1.0",
-        "llava_stage-2.0",
-        "llava_next_stage-1.5",
-        "llava_next_stage-2.0",
-    ] = field(
+    data_preprocessor_type: str = field(
         default_factory=str,
         metadata={
             "help": "preprocessor type, [llava_stage-1.0, llava_stage-2.0, llava_next_stage-1.5, llava_next_stage-2.0]"
@@ -160,11 +150,6 @@ class TrainPipelineArguments:
 
 @dataclass
 class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPipelineArguments):
-    output_dir: str = field(
-        default=None,
-        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
-    )
-
     def __post_init__(self):
         if self.output_dir is None:
             raise ValueError("output_dir은 무조건 설정되어 있어야 한다.")
@@ -234,6 +219,14 @@ class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPi
             **self.config_kwargs,
             "attn_implementation": self.attn_implementation,
         }
+
+        self.tokenizer_kwargs = {
+            **self.tokenizer_kwargs,
+            "padding_side": self.padding_side,
+        }
+
+        if self.chat_template:
+            self.tokenizer_kwargs["chat_template"] = self.chat_template
 
         self.cache_dir = Path(self.cache_dir) if self.cache_dir else None
         self.model_name_or_path = self.resume_from_checkpoint or self.model_name_or_path
@@ -385,60 +378,12 @@ def main(train_args: ImageTextToTextArguments) -> None:
 
         return train_dataset, valid_dataset, test_dataset
 
-    def check_tokenizer(tokenizer: PreTrainedTokenizer) -> PreTrainedTokenizer:
-        # copied from: transformers/models/llama/tokenization_llama.py:LlamaTokenizer:build_inputs_with_special_tokens()
-        def build_inputs_with_special_tokens(tokenizer, token_ids_0, token_ids_1=None):
-            bos_token_id = [tokenizer.bos_token_id] if tokenizer.add_bos_token else []
-            eos_token_id = [tokenizer.eos_token_id] if tokenizer.add_eos_token else []
-
-            output = bos_token_id + token_ids_0 + eos_token_id
-
-            if token_ids_1 is not None:
-                output = output + bos_token_id + token_ids_1 + eos_token_id
-
-            return output
-
-        input_ids = tokenizer("안녕하세요").input_ids
-        bos_token_id, eos_token_id = tokenizer.bos_token_id, tokenizer.eos_token_id
-        bos_token, eos_token = tokenizer.bos_token, tokenizer.eos_token
-        is_add_bos, is_add_eos = input_ids[0] == bos_token_id, input_ids[-1] == eos_token_id
-
-        user_chat = {"role": "user", "content": "Hello, how are you?"}
-        assistant_chat = {"role": "assistant", "content": "I'm fine, thank you."}
-        text = tokenizer.apply_chat_template([user_chat, assistant_chat], tokenize=False)
-
-        msg = ""
-        if not is_add_bos:
-            msg += "tokenizer에 add_bos_token이 False로 되어 있음. 전처리 시, bos토큰이 삽입되지 않을 가능성이 있음.\n"
-        if is_add_bos and bos_token in text:
-            msg += "chat_template과 tokenizer에서 자동으로 bos추가해서 중복되어 들어갈 가능성이 있다.\n"
-            is_add_bos = False
-
-        if not is_add_eos:
-            msg += "tokenizer에 add_eos_token이 False로 되어 있음. 전처리 시, eos토큰이 삽입되지 않을 가능성이 있음.\n"
-        if is_add_eos and eos_token in text:
-            msg += "chat_template과 tokenizer에서 자동으로 eos추가해서 중복되어 들어갈 가능성이 있다.\n"
-            is_add_bos = False
-
-        if train_args.is_world_process_zero:
-            logger.warning(msg.strip())
-
-        setattr(tokenizer, "add_bos_token", is_add_bos)
-        setattr(tokenizer, "add_eos_token", is_add_eos)
-
-        # TODO: 기존에 존재하던 build_inputs_with_special_tokens까지 덮어 씌어비리는 문제가 있다. 이거 나중에 채크해서 수정해야 할 듯.
-        setattr(tokenizer, "build_inputs_with_special_tokens", build_inputs_with_special_tokens)
-
-        return tokenizer
-
     # load model
     processor = AutoProcessor.from_pretrained(train_args.model_name_or_path, **train_args.processor_kwargs)
     config = AutoConfig.from_pretrained(train_args.model_name_or_path, **train_args.config_kwargs)
 
     model_kwargs = {"config": config, **train_args.model_kwargs}
     model = AutoModelForImageTextToText.from_pretrained(train_args.model_name_or_path, **model_kwargs)
-
-    processor.tokenizer = check_tokenizer(processor.tokenizer)
 
     if train_args.freeze_named_param:
         freeze_param_ls = [param for name, param in model.named_parameters() if name in train_args.freeze_named_param]
@@ -465,25 +410,15 @@ def main(train_args: ImageTextToTextArguments) -> None:
             fullgraph=True,
         )
 
-    match train_args.data_preprocessor_type:
-        case "llava_stage-1.0":
-            preprocessor_func = llava_stage1_preprocessor
-        case "llava_stage-2.0":
-            preprocessor_func = llava_stage2_preprocessor
-        case "llava_next_stage-1.5":
-            preprocessor_func = llava_next_stage1_5_preprocessor
-        case "llava_next_stage-2.0":
-            preprocessor_func = llava_next_stage2_preprocessor
-
-    context = (
+    with (
         train_args.main_process_first(desc="main_process_first")
         if train_args.do_data_main_process_first
         else nullcontext()
-    )
-
-    with context:
+    ):
         # load datasets
-        train_dataset, valid_dataset, test_dataset = processing_datasets(preprocessor_func)
+        train_dataset, valid_dataset, test_dataset = processing_datasets(
+            PROCESSOR_REGISTRY[train_args.data_preprocessor_type]
+        )
 
     # load collator
     collator = PackingImageCollator(
@@ -492,20 +427,6 @@ def main(train_args: ImageTextToTextArguments) -> None:
         instruction_template=train_args.instruction_template,
         dtype=model.dtype,
     )
-
-    # collator output check
-    sample_check = collator.torch_call([[train_dataset[0]]] if train_args.do_packing else [train_dataset[0]])
-    if train_args.is_world_process_zero:
-        sample_check["labels"] = sample_check["labels"][sample_check["labels"] != -100].tolist()
-        check_labels = [processor.tokenizer.convert_ids_to_tokens(token) for token in sample_check["labels"]]
-        check_labels = ", ".join(check_labels)
-        logger.info(f"collator_label: [-100,  ..., -100, {check_labels}]")
-
-    if processor.tokenizer.bos_token_id not in sample_check.input_ids[0].tolist():
-        raise ValueError("BOS token이 없다. 이거 다시 전처리 해라.")
-
-    if processor.tokenizer.eos_token_id not in sample_check.input_ids[0].tolist():
-        raise ValueError("EOS token이 없다. 이거 다시 전처리 해라.")
 
     # load trainer
     trainer = PackingTrainer(

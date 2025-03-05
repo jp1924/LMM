@@ -8,7 +8,7 @@ from datasets import Dataset
 from torch.utils.data import DataLoader, RandomSampler, Sampler
 from trl.trainer.utils import DataCollatorForCompletionOnlyLM
 
-from transformers import Trainer
+from transformers import Trainer, TrainingArguments
 from transformers import logging as hf_logging
 from transformers.trainer_pt_utils import LengthGroupedSampler
 from transformers.trainer_utils import has_length, seed_worker
@@ -20,9 +20,58 @@ logger = hf_logging.get_logger("transformers")
 
 
 class PackingImageCollator(DataCollatorForCompletionOnlyLM):
-    def __init__(self, dtype: torch.dtype, **kwargs):
+    def __init__(
+        self,
+        args: TrainingArguments,
+        dtype: torch.dtype,
+        sample_dataset: Optional[Dataset] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.dtype = dtype
+        self.args = args
+        self.clm = clm
+
+        if not self.clm and (sample_dataset and args.is_world_process_zero):
+            formated_instruct = self.tokenizer.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
+            logger.info(f"formated_instruct: {formated_instruct}")
+            logger.info(
+                [(self.tokenizer.convert_ids_to_tokens(ids), ids) for ids in sample_dataset[0]["input_ids"][0]]
+            )
+
+            if args.response_template is not None:
+                response_template = self.tokenizer.decode(args.response_template, skip_special_tokens=False)
+                logger.info(f"response_template: {response_template}")
+                if response_template not in formated_instruct:
+                    raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+            else:
+                raise logger.error("response_template이 없음. 다시 설정하셈.")
+
+            if args.instruction_template is not None:
+                instruction_template = self.tokenizer.decode(args.instruction_template, skip_special_tokens=False)
+                logger.info(f"instruction_template: {instruction_template}")
+                if instruction_template not in formated_instruct:
+                    raise ValueError(
+                        "이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈"
+                    )
+            else:
+                logger.warning("instruction_template이 없음. 근데 애러는 발생하지 않고 그냥 패스함.")
+
+        sample_check = self([sample_dataset[0]])
+        if self.args.is_world_process_zero:
+            sample_check["labels"] = sample_check["labels"][sample_check["labels"] != -100].tolist()
+            check_labels = [self.tokenizer.convert_ids_to_tokens(token) for token in sample_check["labels"]]
+            check_labels = ", ".join(check_labels)
+            logger.info(f"collator_label: [-100,  ..., -100, {check_labels}]")
+
+        if (
+            self.tokenizer.bos_token_id is not None
+            and self.tokenizer.bos_token_id not in sample_check["input_ids"].tolist()[0]
+        ):
+            raise ValueError("BOS token이 없다. 이거 다시 전처리 해라.")
+
+        if self.tokenizer.eos_token_id not in sample_check["input_ids"].tolist()[0]:
+            raise ValueError("EOS token이 없다. 이거 다시 전처리 해라.")
 
     def _create_attention_mask(self, input_length_ls):
         total_length = sum(input_length_ls)
