@@ -1,6 +1,6 @@
 services:
   train_container:
-    container_name: llava
+    container_name: lmm
     build:
       context: .
       dockerfile: Dockerfile
