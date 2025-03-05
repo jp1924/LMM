@@ -1,22 +1,24 @@
 import json
+import logging
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
+import optimization
 import torch
 from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import logging as ds_logging
 from preprocessor import PROCESSOR_REGISTRY
 from setproctitle import setproctitle
-from trainer import PackingImageCollator, PackingTrainer
+from trainer import PackingImageCollatorForCompletionOnlyLM, PackingTrainer
 
 from transformers import (
     AutoConfig,
     AutoModelForImageTextToText,
     AutoProcessor,
     HfArgumentParser,
-    PreTrainedTokenizer,
     TrainingArguments,
 )
 from transformers import logging as hf_logging
@@ -146,14 +148,19 @@ class TrainPipelineArguments:
         default="{}",
         metadata={"help": ""},
     )
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
+    )
+    padding_side: str = field(
+        default="left",
+        metadata={"help": ""},
+    )
 
 
 @dataclass
 class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPipelineArguments):
     def __post_init__(self):
-        if self.output_dir is None:
-            raise ValueError("output_dir은 무조건 설정되어 있어야 한다.")
-
         super().__post_init__()
 
         def _convert_str_dict(passed_value: dict):
@@ -220,8 +227,8 @@ class ImageTextToTextArguments(TrainingArguments, DataPipelineArguments, TrainPi
             "attn_implementation": self.attn_implementation,
         }
 
-        self.tokenizer_kwargs = {
-            **self.tokenizer_kwargs,
+        self.processor_kwargs = {
+            **self.processor_kwargs,
             "padding_side": self.padding_side,
         }
 
@@ -253,15 +260,12 @@ logger = hf_logging.get_logger("transformers")
 
 
 def main(train_args: ImageTextToTextArguments) -> None:
-    def processing_datasets(func: Callable) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
-        def process_dataset(
-            dataset: Dataset,
-            dataset_key: str,
-            repo_name: str,
-            truncate_map: dict,
-            filter_cache_file_name: str,
-        ) -> None:
+    def processing_datasets(
+        func: Callable,
+    ) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
+        def process_dataset(dataset, dataset_key, repo_name, truncate_map, filter_cache_file_name):
             original_size = len(dataset)
+
             if dataset_key in truncate_map:
                 truncate_size = truncate_map[dataset_key]
                 dataset_size = len(dataset)
@@ -270,6 +274,9 @@ def main(train_args: ImageTextToTextArguments) -> None:
                     logger.info(
                         f"{repo_name}의 {dataset_key}크기는 {dataset_size}이지만 truncate_size는 {truncate_size} 크기를 조절하셈."
                     )
+
+            if train_args.is_world_process_zero:
+                range_histogram(dataset["length"], 100, 50)
 
             if dataset_key in train_args.train_dataset_prefix and train_args.do_train:
                 dataset = dataset.filter(
@@ -295,7 +302,7 @@ def main(train_args: ImageTextToTextArguments) -> None:
                 logger.info(f"{repo_name}/{dataset_key}-length: {length_ls}")
                 logger.info(f"{repo_name}/{dataset_key}-size: {original_size} -> {len(dataset)}")
 
-        def concat(datasets_ls: List[Dataset], dataset_type: str) -> Optional[Dataset]:
+        def concat(datasets_ls, dataset_type):
             if datasets_ls:
                 dataset = concatenate_datasets(datasets_ls)
                 dataset.set_format("pt")
@@ -303,6 +310,46 @@ def main(train_args: ImageTextToTextArguments) -> None:
                     logger.info(f"{dataset_type}_dataset:\n{dataset}")
                 return dataset
             return None
+
+        def range_histogram(data, num_bins=50, width=50):
+            # 데이터의 최대값과 최소값 찾기
+            min_val = min(data)
+            max_val = max(data)
+
+            # 구간 크기 계산
+            bin_size = (max_val - min_val) / num_bins
+
+            # 각 구간별 빈도수 계산
+            bins = [0] * num_bins
+            for value in data:
+                bin_index = min(int((value - min_val) / bin_size), num_bins - 1)
+                bins[bin_index] += 1
+
+            # 최대 빈도수 찾기
+            max_freq = max(bins)
+
+            # 히스토그램 출력
+            logger.info(f"\nHistogram (total {len(data)} items, {num_bins} bins)")
+            logger.info("-" * 80)
+            logger.info(f"Range{' ' * 18}Count  Distribution")
+            logger.info("-" * 80)
+
+            for i in range(num_bins):
+                start = min_val + (i * bin_size)
+                end = min_val + ((i + 1) * bin_size)
+                bar_length = int((bins[i] / max_freq) * width)
+                bar = "█" * bar_length
+
+                # 구간과 빈도수, 막대 출력
+                logger.info(f"{start:8.0f}-{end:8.0f}: {bins[i]:6d} |{bar}")
+
+            logger.info("-" * 80)
+            logger.info("\nStatistics:")
+            logger.info(f"데이터 개수: {len(data)}")
+            logger.info(f"최소값: {min_val:.0f}")
+            logger.info(f"최대값: {max_val:.0f}")
+            logger.info(f"평균값: {sum(data) / len(data):.2f}")
+            logger.info(f"구간 크기: {bin_size:.2f}")
 
         start_time = time.time()
         train_dataset_ls, valid_dataset_ls, test_dataset_ls = [], [], []
@@ -342,36 +389,35 @@ def main(train_args: ImageTextToTextArguments) -> None:
             )
 
             for dataset_key in datasets:
-                process_dataset(datasets[dataset_key], dataset_key, repo_name, truncate_map, filter_cache_file_name)
+                process_dataset(
+                    datasets[dataset_key],
+                    dataset_key,
+                    repo_name,
+                    truncate_map,
+                    filter_cache_file_name,
+                )
 
         train_dataset = concat(train_dataset_ls, "train")
         valid_dataset = concat(valid_dataset_ls, "valid")
         test_dataset = concat(test_dataset_ls, "test")
 
-        sample_dataset = train_dataset or valid_dataset or test_dataset
-        if sample_dataset and train_args.is_world_process_zero:
-            formated_instruct = processor.decode(sample_dataset[0]["input_ids"], skip_special_tokens=False)
-            logger.info(f"formated_instruct: {formated_instruct}")
-
-            if train_args.response_template is not None:
-                response_template = processor.decode(train_args.response_template, skip_special_tokens=False)
-                logger.info(f"response_template: {response_template}")
-                if response_template not in formated_instruct:
-                    raise ValueError("이거 response_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈")
+        if train_args.is_world_process_zero and train_dataset:
+            logger.info("train-datasets")
+            range_histogram(train_dataset["length"], 100, 50)
+        if train_args.is_world_process_zero and valid_dataset:
+            logger.info("valid-datasets")
+            if isinstance(valid_dataset, dict):
+                for key in valid_dataset:
+                    range_histogram(valid_dataset[key]["length"], 100, 50)
             else:
-                raise logger.error("response_template이 없음. 다시 설정하셈.")
-
-            if train_args.instruction_template is not None:
-                instruction_template = processor.decode(train_args.instruction_template, skip_special_tokens=False)
-                logger.info(f"instruction_template: {instruction_template}")
-                if instruction_template not in formated_instruct:
-                    raise ValueError(
-                        "이거 instruction_template이 formated_instruct에 포함되어 있지 않음. 다시 설정하셈"
-                    )
+                range_histogram(valid_dataset["length"], 100, 50)
+        if train_args.is_world_process_zero and test_dataset:
+            logger.info("test-datasets")
+            if isinstance(test_dataset, dict):
+                for key in test_dataset:
+                    range_histogram(test_dataset[key]["length"], 100, 50)
             else:
-                logger.warning("instruction_template이 없음. 근데 애러는 발생하지 않고 그냥 패스함.")
-        elif sample_dataset is None:
-            logger.warning("train, valid, test데이터가 전혀 없는 상태인데 확인 한번 해봐.")
+                range_histogram(test_dataset["length"], 100, 50)
 
         if train_args.is_world_process_zero:
             logger.info(f"load_dataset_time: {time.time() - start_time:.2f}")
@@ -421,11 +467,13 @@ def main(train_args: ImageTextToTextArguments) -> None:
         )
 
     # load collator
-    collator = PackingImageCollator(
+    collator = PackingImageCollatorForCompletionOnlyLM(
         tokenizer=processor.tokenizer,
+        args=train_args,
+        sample_dataset=train_dataset or valid_dataset or test_dataset,
+        dtype=model.dtype,
         response_template=train_args.response_template,
         instruction_template=train_args.instruction_template,
-        dtype=model.dtype,
     )
 
     # load trainer
@@ -482,6 +530,17 @@ if "__main__" in __name__:
         set_seed(train_args.seed)
 
     if train_args.run_name is not None:
-        setproctitle(train_args.run_name)
+        setproctitle(f"{train_args.run_name}-{train_args.local_process_index}")
 
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log_level = train_args.get_process_log_level()
+    logger.setLevel(log_level)
+    ds_logging.set_verbosity(log_level)
+    hf_logging.set_verbosity(log_level)
+    hf_logging.enable_default_handler()
+    hf_logging.enable_explicit_format()
     main(train_args)
