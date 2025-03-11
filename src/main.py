@@ -265,18 +265,7 @@ def main(train_args: ImageTextToTextArguments) -> None:
     config = AutoConfig.from_pretrained(train_args.model_name_or_path, **train_args.config_kwargs)
 
     model_kwargs = {"config": config, **train_args.model_kwargs}
-
-    with (
-        train_args.main_process_first(desc="main_process_first")
-        if train_args.do_data_main_process_first
-        else nullcontext()
-    ):
-        # load datasets
-        train_dataset, valid_dataset, test_dataset = processing_datasets(
-            PROCESSOR_REGISTRY[train_args.data_preprocessor_type]
-        )
-
-        model = AutoModelForImageTextToText.from_pretrained(train_args.model_name_or_path, **model_kwargs)
+    model = AutoModelForImageTextToText.from_pretrained(train_args.model_name_or_path, **model_kwargs)
 
     if train_args.freeze_named_param:
         freeze_param_ls = [param for name, param in model.named_parameters() if name in train_args.freeze_named_param]
@@ -301,6 +290,16 @@ def main(train_args: ImageTextToTextArguments) -> None:
             backend=train_args.torch_compile_backend,
             mode=train_args.torch_compile_mode,
             fullgraph=True,
+        )
+
+    with (
+        train_args.main_process_first(desc="main_process_first")
+        if train_args.do_data_main_process_first
+        else nullcontext()
+    ):
+        # load datasets
+        train_dataset, valid_dataset, test_dataset = processing_datasets(
+            PROCESSOR_REGISTRY[train_args.data_preprocessor_type], train_args, processor
         )
 
     # load collator
